@@ -59,7 +59,8 @@ func (w *WorkdirCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile
 
 	// Only create and snapshot the dir if it didn't exist already
 	w.snapshotFiles = []string{}
-	if _, err := os.Stat(config.WorkingDir); os.IsNotExist(err) {
+	rootedWorkingDir := util.RootedPath(config.WorkingDir)
+	if _, err := os.Stat(rootedWorkingDir); os.IsNotExist(err) {
 		uid, gid := int64(-1), int64(-1)
 
 		if config.User != "" {
@@ -71,8 +72,8 @@ func (w *WorkdirCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile
 		}
 
 		logrus.Infof("Creating directory %s with uid %d and gid %d", config.WorkingDir, uid, gid)
-		w.snapshotFiles = append(w.snapshotFiles, config.WorkingDir)
-		if err := mkdirAllWithPermissions(config.WorkingDir, 0755, uid, gid); err != nil {
+		w.snapshotFiles = append(w.snapshotFiles, rootedWorkingDir)
+		if err := mkdirAllWithPermissions(rootedWorkingDir, 0755, uid, gid); err != nil {
 			return errors.Wrapf(err, "creating workdir %s", config.WorkingDir)
 		}
 	}

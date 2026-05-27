@@ -20,6 +20,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -28,11 +29,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/GoogleContainerTools/kaniko/pkg/config"
 	"github.com/GoogleContainerTools/kaniko/pkg/timing"
+	securejoin "github.com/cyphar/filepath-securejoin"
 	"github.com/docker/docker/pkg/archive"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/karrick/godirwalk"
@@ -107,10 +110,7 @@ func IgnoreList() []IgnoreListEntry {
 }
 
 func AddToIgnoreList(entry IgnoreListEntry) {
-	ignorelist = append(ignorelist, IgnoreListEntry{
-		Path:            filepath.Clean(entry.Path),
-		PrefixMatchOnly: entry.PrefixMatchOnly,
-	})
+	ignorelist = append(ignorelist, normalizeIgnoreListEntry(entry))
 }
 
 func AddToDefaultIgnoreList(entry IgnoreListEntry) {
@@ -118,6 +118,56 @@ func AddToDefaultIgnoreList(entry IgnoreListEntry) {
 		Path:            filepath.Clean(entry.Path),
 		PrefixMatchOnly: entry.PrefixMatchOnly,
 	})
+}
+
+func normalizeIgnoreListEntry(entry IgnoreListEntry) IgnoreListEntry {
+	path := filepath.Clean(entry.Path)
+	if filepath.IsAbs(path) {
+		path = RootedPath(path)
+	}
+	return IgnoreListEntry{
+		Path:            path,
+		PrefixMatchOnly: entry.PrefixMatchOnly,
+	}
+}
+
+func RootedPath(path string) string {
+	rooted, err := ResolvePathInRoot(path)
+	if err != nil {
+		root := filepath.Clean(config.RootDir)
+		if root == string(os.PathSeparator) {
+			return filepath.Clean(path)
+		}
+		cleaned := filepath.Clean(path)
+		if filepath.IsAbs(cleaned) {
+			cleaned = strings.TrimPrefix(cleaned, string(os.PathSeparator))
+		}
+		return filepath.Join(root, cleaned)
+	}
+	return rooted
+}
+
+func ResolvePathInRoot(path string) (string, error) {
+	cleanedRoot := filepath.Clean(config.RootDir)
+	cleanedPath := filepath.Clean(path)
+	if cleanedPath == "." {
+		cleanedPath = string(os.PathSeparator)
+	}
+	if cleanedRoot == string(os.PathSeparator) {
+		return cleanedPath, nil
+	}
+
+	unsafePath := cleanedPath
+	if hasCleanedFilepathPrefix(cleanedPath, cleanedRoot, false) {
+		rel, err := filepath.Rel(cleanedRoot, cleanedPath)
+		if err != nil {
+			return "", err
+		}
+		unsafePath = rel
+	} else if filepath.IsAbs(cleanedPath) {
+		unsafePath = strings.TrimPrefix(cleanedPath, string(os.PathSeparator))
+	}
+	return securejoin.SecureJoin(cleanedRoot, unsafePath)
 }
 
 func IncludeWhiteout() FSOpt {
@@ -198,6 +248,12 @@ func GetFSFromLayers(root string, layers []v1.Layer, opts ...FSOpt) ([]string, e
 
 				name := strings.TrimPrefix(base, archive.WhiteoutPrefix)
 				path := filepath.Join(dir, name)
+				if shouldResolveInRoot(root) {
+					path, err = ResolvePathInRoot(path)
+					if err != nil {
+						return nil, errors.Wrapf(err, "resolving whiteout path %s", hdr.Name)
+					}
+				}
 
 				if CheckCleanedPathAgainstIgnoreList(path) {
 					logrus.Tracef("Not deleting %s, as it's ignored", path)
@@ -301,6 +357,13 @@ func UnTar(r io.Reader, dest string) ([]string, error) {
 
 func ExtractFile(dest string, hdr *tar.Header, cleanedName string, tr io.Reader) error {
 	path := filepath.Join(dest, cleanedName)
+	if shouldResolveInRoot(dest) {
+		rootedPath, err := ResolvePathInRoot(path)
+		if err != nil {
+			return err
+		}
+		path = rootedPath
+	}
 	base := filepath.Base(path)
 	dir := filepath.Dir(path)
 	mode := hdr.FileInfo().Mode()
@@ -388,7 +451,17 @@ func ExtractFile(dest string, hdr *tar.Header, cleanedName string, tr io.Reader)
 				return errors.Wrapf(err, "error removing %s to make way for new link", hdr.Name)
 			}
 		}
-		link := filepath.Clean(filepath.Join(dest, hdr.Linkname))
+		linkName := hdr.Linkname
+		if filepath.IsAbs(linkName) {
+			linkName = strings.TrimPrefix(filepath.Clean(linkName), string(os.PathSeparator))
+		}
+		link := filepath.Clean(filepath.Join(dest, linkName))
+		if shouldResolveInRoot(dest) {
+			link, err = ResolvePathInRoot(link)
+			if err != nil {
+				return err
+			}
+		}
 		if err := os.Link(link, path); err != nil {
 			return err
 		}
@@ -413,6 +486,14 @@ func ExtractFile(dest string, hdr *tar.Header, cleanedName string, tr io.Reader)
 	return nil
 }
 
+func shouldResolveInRoot(path string) bool {
+	root := filepath.Clean(config.RootDir)
+	if root == string(os.PathSeparator) {
+		return false
+	}
+	return hasCleanedFilepathPrefix(filepath.Clean(path), root, false)
+}
+
 func IsInProvidedIgnoreList(path string, wl []IgnoreListEntry) bool {
 	path = filepath.Clean(path)
 	for _, entry := range wl {
@@ -429,8 +510,8 @@ func IsInIgnoreList(path string) bool {
 }
 
 func CheckCleanedPathAgainstProvidedIgnoreList(path string, wl []IgnoreListEntry) bool {
-	for _, wl := range ignorelist {
-		if hasCleanedFilepathPrefix(path, wl.Path, wl.PrefixMatchOnly) {
+	for _, entry := range ignorelist {
+		if hasCleanedFilepathPrefix(path, entry.Path, entry.PrefixMatchOnly) {
 			return true
 		}
 	}
@@ -481,7 +562,7 @@ func DetectFilesystemIgnoreList(path string) error {
 			}
 			continue
 		}
-		if lineArr[4] != config.RootDir {
+		if lineArr[4] != config.RootDir && lineArr[4] != string(os.PathSeparator) {
 			logrus.Tracef("Adding ignore list entry %s from line: %s", lineArr[4], line)
 			AddToIgnoreList(IgnoreListEntry{
 				Path:            lineArr[4],
@@ -574,7 +655,7 @@ func resetFileOwnershipIfNotMatching(path string, newUID, newGID uint32) error {
 		return fmt.Errorf("can't convert fs.FileInfo of %v to linux syscall.Stat_t", path)
 	}
 	if stat.Uid != newUID && stat.Gid != newGID {
-		err = os.Chown(path, int(newUID), int(newGID))
+		err = chownTolerant(path, int(newUID), int(newGID))
 		if err != nil {
 			return errors.Wrap(err, "reseting file ownership to root")
 		}
@@ -866,7 +947,7 @@ func MkdirAllWithPermissions(path string, mode os.FileMode, uid, gid int64) erro
 			),
 		)
 	}
-	if err := os.Chown(path, int(uid), int(gid)); err != nil {
+	if err := chownTolerant(path, int(uid), int(gid)); err != nil {
 		return err
 	}
 	// In some cases, MkdirAll doesn't change the permissions, so run Chmod
@@ -874,8 +955,48 @@ func MkdirAllWithPermissions(path string, mode os.FileMode, uid, gid int64) erro
 	return os.Chmod(path, mode)
 }
 
+// chownEinvalWarnOnce ensures we surface the user-namespace chown(EINVAL)
+// limitation only once per process, regardless of how many tar entries trip
+// over it.
+var chownEinvalWarnOnce sync.Once
+
+// chownTolerant performs an os.Chown but, when running inside the kaniko
+// user-namespace fallback (KANIKO_SANDBOX_USERNS=1), demotes EINVAL into a
+// warning instead of a fatal error.
+//
+// Background: when we re-execute kaniko inside `unshare(CLONE_NEWUSER |
+// CLONE_NEWNS)` to gain CAP_SYS_ADMIN for bind-mounting /proc, /sys, /dev,
+// only a single uid/gid pair is mapped (caller -> 0). Any chown to a uid or
+// gid outside that mapping is rejected by the kernel with EINVAL — alpine's
+// /etc/shadow (gid=42) is the canonical case.
+//
+// Skipping the chown is safe for base-image extraction because kaniko reuses
+// the original layer tar bytes for unmodified base layers, so the final
+// image still records the original ownership. Only files that are *both*
+// owned by an unmapped uid/gid in the base AND modified by a RUN step lose
+// their original ownership; the resulting fall back is uid=0/gid=0, which
+// matches what most Dockerfiles expect anyway.
+func chownTolerant(path string, uid, gid int) error {
+	err := os.Chown(path, uid, gid)
+	if err == nil {
+		return nil
+	}
+	if os.Getenv("KANIKO_SANDBOX_USERNS") != "1" {
+		return err
+	}
+	var pathErr *os.PathError
+	if !stderrors.As(err, &pathErr) || !stderrors.Is(pathErr.Err, syscall.EINVAL) {
+		return err
+	}
+	chownEinvalWarnOnce.Do(func() {
+		logrus.Warnf("Sandbox: chown(%s, %d, %d) returned EINVAL inside the user namespace because the uid/gid is unmapped; ignoring this and any further unmapped chown calls (set KANIKO_SANDBOX_USERNS=skip and run with CAP_SYS_ADMIN if you need exact ownership for RUN-modified files).", path, uid, gid)
+	})
+	logrus.Debugf("Sandbox: ignoring chown(%s, %d, %d) EINVAL", path, uid, gid)
+	return nil
+}
+
 func setFilePermissions(path string, mode os.FileMode, uid, gid int) error {
-	if err := os.Chown(path, uid, gid); err != nil {
+	if err := chownTolerant(path, uid, gid); err != nil {
 		return err
 	}
 	// manually set permissions on file, since the default umask (022) will interfere
@@ -941,6 +1062,16 @@ func GetSymLink(path string) (string, error) {
 func EvalSymLink(path string) (string, error) {
 	if err := getSymlink(path); err != nil {
 		return "", err
+	}
+	if shouldResolveInRoot(path) {
+		resolved, err := ResolvePathInRoot(path)
+		if err != nil {
+			return "", err
+		}
+		if _, err := os.Stat(resolved); err != nil {
+			return "", err
+		}
+		return resolved, nil
 	}
 	return filepath.EvalSymlinks(path)
 }
@@ -1031,7 +1162,7 @@ func CopyOwnership(src string, destDir string, root string) error {
 			return errors.Wrap(err, "reading ownership")
 		}
 		stat := info.Sys().(*syscall.Stat_t)
-		return os.Chown(destPath, int(stat.Uid), int(stat.Gid))
+		return chownTolerant(destPath, int(stat.Uid), int(stat.Gid))
 	})
 }
 
@@ -1082,7 +1213,10 @@ func createParentDirectory(path string, uid int, gid int) error {
 // - mounted paths via DetectFilesystemIgnoreList()
 func InitIgnoreList() error {
 	logrus.Trace("Initializing ignore list")
-	ignorelist = append([]IgnoreListEntry{}, defaultIgnoreList...)
+	ignorelist = []IgnoreListEntry{}
+	for _, entry := range defaultIgnoreList {
+		ignorelist = append(ignorelist, normalizeIgnoreListEntry(entry))
+	}
 
 	if err := DetectFilesystemIgnoreList(config.MountInfoPath); err != nil {
 		return errors.Wrap(err, "checking filesystem mount paths for ignore list")

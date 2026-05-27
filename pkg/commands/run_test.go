@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/GoogleContainerTools/kaniko/pkg/config"
 	"github.com/GoogleContainerTools/kaniko/pkg/dockerfile"
 	"github.com/GoogleContainerTools/kaniko/testutil"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -314,4 +315,45 @@ func TestSetWorkDirIfExists(t *testing.T) {
 	testDir := t.TempDir()
 	testutil.CheckDeepEqual(t, testDir, setWorkDirIfExists(testDir))
 	testutil.CheckDeepEqual(t, "", setWorkDirIfExists("doesnot-exists"))
+}
+
+func TestSetWorkDirIfExistsWithSandboxRoot(t *testing.T) {
+	originalRootDir := config.RootDir
+	defer func() {
+		config.RootDir = originalRootDir
+	}()
+
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.RootDir = root
+	if err := os.MkdirAll(filepath.Join(root, "work"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	testutil.CheckDeepEqual(t, "/work", setWorkDirIfExists("/work"))
+	testutil.CheckDeepEqual(t, "", setWorkDirIfExists("/missing"))
+}
+
+func TestLookPathWithSandboxRoot(t *testing.T) {
+	originalRootDir := config.RootDir
+	defer func() {
+		config.RootDir = originalRootDir
+	}()
+
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.RootDir = root
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bin", "tool"), []byte{}, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := lookPath("tool", "/bin")
+	testutil.CheckErrorAndDeepEqual(t, false, err, "/bin/tool", got)
 }

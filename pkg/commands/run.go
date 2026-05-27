@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -76,7 +77,7 @@ func runCommandInExec(config *v1.Config, buildArgs *dockerfile.BuildArgs, cmdRun
 			oldPath := os.Getenv("PATH")
 			defer os.Setenv("PATH", oldPath)
 			os.Setenv("PATH", entry[1])
-			path, err := exec.LookPath(newCommand[0])
+			path, err := lookPath(newCommand[0], entry[1])
 			if err == nil {
 				newCommand[0] = path
 			}
@@ -93,6 +94,12 @@ func runCommandInExec(config *v1.Config, buildArgs *dockerfile.BuildArgs, cmdRun
 	cmd.Stderr = os.Stderr
 	replacementEnvs := buildArgs.ReplacementEnvs(config.Env)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if filepath.Clean(kConfig.RootDir) != "/" {
+		cmd.SysProcAttr.Chroot = kConfig.RootDir
+		if cmd.Dir == "" {
+			cmd.Dir = "/"
+		}
+	}
 
 	u := config.User
 	userAndGroup := strings.Split(u, ":")
@@ -261,8 +268,44 @@ func (cr *CachingRunCommand) MetadataOnly() bool {
 
 // todo: this should create the workdir if it doesn't exist, atleast this is what docker does
 func setWorkDirIfExists(workdir string) string {
-	if _, err := os.Lstat(workdir); err == nil {
+	if workdir == "" {
+		return ""
+	}
+	if _, err := os.Lstat(util.RootedPath(workdir)); err == nil {
 		return workdir
 	}
 	return ""
+}
+
+func lookPath(file, pathEnv string) (string, error) {
+	if filepath.Clean(kConfig.RootDir) == "/" {
+		return exec.LookPath(file)
+	}
+	if strings.Contains(file, string(os.PathSeparator)) {
+		if err := validateExecutableInRoot(file); err != nil {
+			return "", err
+		}
+		return file, nil
+	}
+	for _, dir := range filepath.SplitList(pathEnv) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, file)
+		if err := validateExecutableInRoot(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", exec.ErrNotFound
+}
+
+func validateExecutableInRoot(file string) error {
+	info, err := os.Stat(util.RootedPath(file))
+	if err != nil {
+		return err
+	}
+	if info.IsDir() || info.Mode()&0o111 == 0 {
+		return os.ErrPermission
+	}
+	return nil
 }

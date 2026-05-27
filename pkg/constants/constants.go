@@ -24,6 +24,8 @@ const (
 
 	DefaultKanikoPath = "/kaniko"
 
+	DefaultSandboxPath = "/kaniko/sandbox"
+
 	Author = "kaniko"
 
 	// ContextTar is the default name of the tar uploaded to GCS buckets

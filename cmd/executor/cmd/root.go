@@ -21,10 +21,13 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/GoogleContainerTools/kaniko/pkg/buildcontext"
@@ -42,6 +45,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -127,6 +131,11 @@ var RootCmd = &cobra.Command{
 			if err := checkKanikoDir(dir); err != nil {
 				return err
 			}
+			if opts.Sandbox {
+				if err := setupSandbox(); err != nil {
+					return err
+				}
+			}
 
 			resolveEnvironmentBuildArgs(opts.BuildArgs, os.Getenv)
 
@@ -193,6 +202,10 @@ var RootCmd = &cobra.Command{
 		}
 		if err := executor.DoPush(image, opts); err != nil {
 			exit(errors.Wrap(err, "error pushing image"))
+		}
+
+		if opts.Sandbox {
+			teardownSandboxIfActive()
 		}
 
 		benchmarkFile := os.Getenv("BENCHMARK_FILE")
@@ -280,6 +293,7 @@ func addKanikoOptionsFlags() {
 	RootCmd.PersistentFlags().VarP(&opts.IgnorePaths, "ignore-path", "", "Ignore these paths when taking a snapshot. Set it repeatedly for multiple paths.")
 	RootCmd.PersistentFlags().BoolVarP(&opts.ForceBuildMetadata, "force-build-metadata", "", false, "Force add metadata layers to build image")
 	RootCmd.PersistentFlags().BoolVarP(&opts.SkipPushPermissionCheck, "skip-push-permission-check", "", false, "Skip check of the push permission")
+	RootCmd.PersistentFlags().BoolVarP(&opts.Sandbox, "sandbox", "", false, "Build the image filesystem inside /kaniko/sandbox instead of the container root filesystem.")
 
 	// Deprecated flags.
 	RootCmd.PersistentFlags().StringVarP(&opts.SnapshotModeDeprecated, "snapshotMode", "", "", "This flag is deprecated. Please use '--snapshot-mode'.")
@@ -293,6 +307,425 @@ func addHiddenFlags(cmd *cobra.Command) {
 	pflag.CommandLine.MarkHidden("azure-container-registry-config")
 	// Hide this flag as we want to encourage people to use the --context flag instead
 	cmd.PersistentFlags().MarkHidden("bucket")
+}
+
+// Environment variable used to mark the user-namespace re-exec child so we
+// don't infinitely re-exec.  Set to "skip" to opt out of automatic user
+// namespace re-exec entirely (e.g. when the runtime really does have
+// CAP_SYS_ADMIN but lies in /proc/self/status, or for debugging).
+const sandboxUserNSEnvVar = "KANIKO_SANDBOX_USERNS"
+
+func setupSandbox() error {
+	sandboxPath := filepath.Clean(constants.DefaultSandboxPath)
+	if sandboxPath == string(os.PathSeparator) || sandboxPath == "." {
+		return errors.Errorf("refusing to use unsafe sandbox path %s", sandboxPath)
+	}
+	if !strings.HasPrefix(sandboxPath, filepath.Clean(constants.DefaultKanikoPath)+string(os.PathSeparator)) {
+		return errors.Errorf("sandbox path %s must be under %s", sandboxPath, constants.DefaultKanikoPath)
+	}
+	if info, err := os.Lstat(constants.DefaultKanikoPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return errors.Errorf("kaniko directory %s must not be a symlink when sandbox mode is enabled", constants.DefaultKanikoPath)
+	}
+
+	// If we lack CAP_SYS_ADMIN we cannot bind-mount /proc, /sys, /dev into
+	// the sandbox, and RUN commands that depend on /proc/self/exe (zig,
+	// python, the glibc loader, ...) will fail with FileNotFound. The
+	// portable fix is to re-execute kaniko inside a user+mount namespace,
+	// where we have full caps with respect to that namespace and can
+	// bind-mount freely. The kernel destroys all mounts when the namespace
+	// goes away, so there is nothing to clean up.
+	nsState := os.Getenv(sandboxUserNSEnvVar)
+	switch nsState {
+	case "":
+		if !hasCapSysAdmin() {
+			logrus.Info("Sandbox: CAP_SYS_ADMIN not available; re-executing inside a user+mount namespace so /proc, /sys, /dev can be bind-mounted (set KANIKO_SANDBOX_USERNS=skip to disable)")
+			return reExecInUserNamespace()
+		}
+	case "skip":
+		if !hasCapSysAdmin() {
+			logrus.Warn("Sandbox: CAP_SYS_ADMIN not available and user-namespace re-exec was skipped (KANIKO_SANDBOX_USERNS=skip); RUN commands that need /proc, /sys or /dev may fail with FileNotFound")
+		}
+	default:
+		logrus.Debugf("Sandbox: running inside user-namespace re-exec child (%s=%s)", sandboxUserNSEnvVar, nsState)
+	}
+
+	if info, err := os.Lstat(sandboxPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.Errorf("sandbox path %s must not be a symlink", sandboxPath)
+		}
+		if !info.IsDir() {
+			return errors.Errorf("sandbox path %s exists and is not a directory", sandboxPath)
+		}
+	} else if os.IsNotExist(err) {
+		if err := os.MkdirAll(sandboxPath, 0o755); err != nil {
+			return errors.Wrap(err, "creating sandbox directory")
+		}
+	} else {
+		return errors.Wrap(err, "checking sandbox directory")
+	}
+
+	// Detach leftover bind-mounts and wipe contents from a previous run.
+	if err := wipeSandboxContents(sandboxPath); err != nil {
+		return errors.Wrap(err, "resetting sandbox")
+	}
+
+	config.RootDir = sandboxPath
+	mountSandboxKernelFilesystems(sandboxPath)
+	setupSandboxRuntimeFiles(sandboxPath)
+	activeSandboxPath = sandboxPath
+	installSandboxCleanup()
+	logrus.Infof("Sandbox mode enabled. Image filesystem root: %s", config.RootDir)
+	return nil
+}
+
+// hasCapSysAdmin returns true if the calling process currently has
+// CAP_SYS_ADMIN in its effective capability set. We parse /proc/self/status
+// rather than calling capget() so the implementation stays vendor-free and
+// works the same way on every Linux kernel.
+func hasCapSysAdmin() bool {
+	const capSysAdminBit = 21 // CAP_SYS_ADMIN, see capabilities(7).
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		// If /proc isn't readable we have bigger problems; assume no caps so
+		// we attempt the user-namespace path.
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		const prefix = "CapEff:"
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		val, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, prefix)), 16, 64)
+		if err != nil {
+			return false
+		}
+		return val&(1<<capSysAdminBit) != 0
+	}
+	return false
+}
+
+// sandboxStandardIDMapSize is how many host uid/gid values are mapped 1:1 into
+// the user namespace when kaniko runs as root. 65536 covers typical image tar
+// entries (e.g. alpine /etc/shadow gid=42) and RUN steps such as adduser/chown.
+const sandboxStandardIDMapSize = 65536
+
+// sandboxUserNamespaceIDMaps returns uid_map / gid_map entries for the
+// user-namespace re-exec child. When the caller is root we map the standard
+// 16-bit id space 1:1 so RUN adduser/chown and base-layer extraction both work.
+// Non-root callers only get a single uid/gid mapped (kernel restriction).
+func sandboxUserNamespaceIDMaps(callerUID, callerGID int) (uidMaps, gidMaps []syscall.SysProcIDMap, enableSetgroups bool) {
+	if callerUID == 0 && callerGID == 0 {
+		m := []syscall.SysProcIDMap{{ContainerID: 0, HostID: 0, Size: sandboxStandardIDMapSize}}
+		return m, m, true
+	}
+	return []syscall.SysProcIDMap{{ContainerID: 0, HostID: callerUID, Size: 1}},
+		[]syscall.SysProcIDMap{{ContainerID: 0, HostID: callerGID, Size: 1}},
+		false
+}
+
+// reExecInUserNamespace forks a copy of /proc/self/exe inside a new user and
+// mount namespace, maps uids/gids into that namespace, and waits for it to
+// finish. The child process inherits a full capability set with respect to its
+// own user namespace, so it can bind-mount /proc, /sys and /dev into
+// /kaniko/sandbox without needing host-level CAP_SYS_ADMIN.
+//
+// On success this function does NOT return; it exits the parent with the
+// child's exit code. On failure to start the child (typically because
+// /proc/sys/kernel/unprivileged_userns_clone is 0 or seccomp blocks
+// unshare(CLONE_NEWUSER)) it returns an error so the caller can decide how
+// to surface it.
+func reExecInUserNamespace() error {
+	exe, err := os.Readlink("/proc/self/exe")
+	if err != nil {
+		// Fall back to /proc/self/exe directly; exec(2) follows it.
+		exe = "/proc/self/exe"
+	}
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Env = append(os.Environ(), sandboxUserNSEnvVar+"=1")
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	uidMaps, gidMaps, enableSetgroups := sandboxUserNamespaceIDMaps(os.Getuid(), os.Getgid())
+	if enableSetgroups {
+		logrus.Infof("Sandbox: mapping uids/gids 0-%d 1:1 into user namespace (RUN adduser/chown supported)", sandboxStandardIDMapSize-1)
+	} else {
+		logrus.Warnf("Sandbox: mapping only container uid/gid 0 -> host %d/%d; RUN adduser or chown to other users will fail with EINVAL", os.Getuid(), os.Getgid())
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags:                 syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+		UidMappings:                uidMaps,
+		GidMappings:                gidMaps,
+		GidMappingsEnableSetgroups: enableSetgroups,
+	}
+
+	if err := cmd.Start(); err != nil {
+		return errors.Wrap(err,
+			"sandbox: cannot create user namespace (kernel may have disabled "+
+				"unprivileged user namespaces; check `sysctl kernel.unprivileged_userns_clone` "+
+				"and the seccomp profile, or set "+sandboxUserNSEnvVar+"=skip to disable this fallback)")
+	}
+
+	// Forward common signals from the parent so e.g. CI cancellation kills
+	// the child cleanly. PID namespace is shared so this also lets us avoid
+	// orphaning the child if our parent dies.
+	sigCh := make(chan os.Signal, 4)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case sig := <-sigCh:
+				if cmd.Process != nil {
+					_ = cmd.Process.Signal(sig)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	waitErr := cmd.Wait()
+	close(done)
+	signal.Stop(sigCh)
+
+	if waitErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) {
+			os.Exit(exitErr.ExitCode())
+		}
+		return errors.Wrap(waitErr, "sandbox: user-namespace child failed")
+	}
+	os.Exit(0)
+	return nil // unreachable; satisfies the compiler.
+}
+
+// activeSandboxPath is set once setupSandbox succeeds. teardownSandboxIfActive
+// uses it to unmount kernel bind-mounts and remove build artifacts when kaniko
+// exits (success, failure, or signal).
+var activeSandboxPath string
+
+// sandboxCleanupOnce guards installSandboxCleanup so repeated calls (e.g. when
+// running unit tests through the same process) don't stack signal handlers.
+var sandboxCleanupOnce sync.Once
+
+// sandboxTeardownOnce ensures we only wipe the sandbox once per process.
+var sandboxTeardownOnce sync.Once
+
+// wipeSandboxContents lazily unmounts kernel bind-mounts under sandboxPath,
+// then deletes every entry inside the directory. The sandbox directory itself
+// is kept so the next run can reuse it.
+func wipeSandboxContents(sandboxPath string) error {
+	if err := unmountSandboxMounts(sandboxPath); err != nil {
+		logrus.Warnf("Sandbox: failed to unmount filesystems under %s: %v", sandboxPath, err)
+	}
+	entries, err := os.ReadDir(sandboxPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return errors.Wrap(err, "reading sandbox directory")
+	}
+	var firstErr error
+	for _, entry := range entries {
+		entryPath := filepath.Join(sandboxPath, entry.Name())
+		if err := os.RemoveAll(entryPath); err != nil {
+			logrus.Warnf("Sandbox: failed to remove %s: %v", entryPath, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+// teardownSandboxIfActive unmounts /proc, /sys, /dev bind-mounts and removes
+// all files left in /kaniko/sandbox. Safe to call multiple times.
+func teardownSandboxIfActive() {
+	path := activeSandboxPath
+	if path == "" {
+		return
+	}
+	sandboxTeardownOnce.Do(func() {
+		logrus.Infof("Sandbox: cleaning up %s", path)
+		if err := wipeSandboxContents(path); err != nil {
+			logrus.Warnf("Sandbox: cleanup incomplete: %v", err)
+			return
+		}
+		logrus.Infof("Sandbox: cleanup complete (%s is empty)", path)
+	})
+}
+
+// installSandboxCleanup arranges for the sandbox to be wiped when kaniko
+// receives SIGINT or SIGTERM so a cancelled CI run does not leave bind-mounts
+// or a full unpacked rootfs under /kaniko/sandbox/.
+func installSandboxCleanup() {
+	sandboxCleanupOnce.Do(func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			sig := <-ch
+			logrus.Infof("Sandbox: received %s, cleaning up sandbox", sig)
+			teardownSandboxIfActive()
+			// Re-raise the signal with the default handler so we exit with
+			// the usual 128+signo status instead of a clean 0.
+			signal.Reset(sig.(syscall.Signal))
+			_ = syscall.Kill(syscall.Getpid(), sig.(syscall.Signal))
+		}()
+	})
+}
+
+// sandboxKernelMounts lists the host pseudo-filesystems that must be visible
+// inside the chrooted sandbox so that programs invoked by RUN can resolve
+// /proc/self/exe, open /dev/null, etc. Without /proc, statically linked tools
+// like Zig fail with FileNotFound when they try to locate their own install
+// directory.
+var sandboxKernelMounts = []struct {
+	source string
+	target string
+	mode   os.FileMode
+}{
+	{"/proc", "proc", 0o555},
+	{"/sys", "sys", 0o555},
+	{"/dev", "dev", 0o755},
+}
+
+// mountSandboxKernelFilesystems bind-mounts /proc, /sys and /dev from the host
+// into the sandbox so that RUN commands (chrooted into /kaniko/sandbox) can
+// resolve runtime paths like /proc/self/exe, open /dev/null, /dev/urandom,
+// etc. The mounts are made MS_PRIVATE|MS_REC right after binding so a later
+// unmount cannot propagate back to the host's /proc, /sys, /dev. Mount
+// targets are always added to the default ignore list (even when the mount
+// itself fails) so they never end up in the resulting image.
+//
+// Failures are logged but not fatal: kaniko may run without CAP_SYS_ADMIN,
+// in which case RUN commands that depend on these paths will surface their
+// own errors (typically "FileNotFound"). The warning makes that diagnosis
+// obvious.
+func mountSandboxKernelFilesystems(sandboxPath string) {
+	mounted := make([]string, 0, len(sandboxKernelMounts))
+	for _, m := range sandboxKernelMounts {
+		target := filepath.Join(sandboxPath, m.target)
+
+		// Always ignore the target, even if we fail to mount on top of it,
+		// otherwise an empty directory would be baked into the resulting image.
+		util.AddToDefaultIgnoreList(util.IgnoreListEntry{
+			Path:            target,
+			PrefixMatchOnly: false,
+		})
+
+		if _, err := os.Stat(m.source); err != nil {
+			logrus.Warnf("Sandbox kernel fs %s not available on host; skipping bind mount: %v", m.source, err)
+			continue
+		}
+		if err := os.MkdirAll(target, m.mode); err != nil {
+			logrus.Warnf("Sandbox: cannot create bind-mount target %s for %s: %v", target, m.source, err)
+			continue
+		}
+		if err := unix.Mount(m.source, target, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+			logrus.Warnf("Sandbox: bind-mount %s -> %s failed (RUN commands relying on %s may fail with FileNotFound; ensure the kaniko container has CAP_SYS_ADMIN): %v", m.source, target, m.source, err)
+			continue
+		}
+		// Detach the new mount from the source's propagation group so that a
+		// later lazy unmount cannot propagate back to the host's /proc,
+		// /sys, /dev. This is the standard pattern used by container
+		// runtimes when bind-mounting kernel filesystems.
+		if err := unix.Mount("none", target, "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
+			logrus.Warnf("Sandbox: could not make %s private (host propagation risk): %v", target, err)
+		}
+		mounted = append(mounted, target)
+		logrus.Infof("Sandbox: bind-mounted %s into %s", m.source, target)
+	}
+	if len(mounted) > 0 {
+		logrus.Infof("Sandbox: %d kernel filesystem(s) bind-mounted: %s", len(mounted), strings.Join(mounted, ", "))
+	} else {
+		logrus.Warn("Sandbox: no kernel filesystems were bind-mounted; RUN commands that need /proc, /sys or /dev (e.g. tools that read /proc/self/exe like zig, python, glibc loader) may fail with FileNotFound")
+	}
+}
+
+// unmountSandboxMounts lazily unmounts every filesystem currently mounted at
+// or under sandboxPath. We use MNT_DETACH so leftover open file descriptors
+// from a previous run (e.g. a kaniko process that crashed) don't keep us from
+// resetting the sandbox. mountinfo's mount-point field can contain escaped
+// characters (e.g. \040 for space, \011 for tab) which we decode before
+// comparing against sandboxPath.
+func unmountSandboxMounts(sandboxPath string) error {
+	mountInfo := config.MountInfoPath
+	if mountInfo == "" {
+		mountInfo = constants.MountInfoPath
+	}
+	data, err := os.ReadFile(mountInfo)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	prefix := sandboxPath + string(os.PathSeparator)
+	var mountPoints []string
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Split(line, " ")
+		if len(fields) < 5 {
+			continue
+		}
+		mp := unescapeMountField(fields[4])
+		if mp == sandboxPath || strings.HasPrefix(mp, prefix) {
+			mountPoints = append(mountPoints, mp)
+		}
+	}
+	// Unmount children before parents so we don't leave dangling submounts.
+	for i := len(mountPoints) - 1; i >= 0; i-- {
+		if err := unix.Unmount(mountPoints[i], unix.MNT_DETACH); err != nil {
+			logrus.Debugf("Failed to lazily unmount %s: %v", mountPoints[i], err)
+		}
+	}
+	return nil
+}
+
+// unescapeMountField decodes the octal escapes (\040, \011, \012, \134) the
+// kernel uses for spaces, tabs, newlines and backslashes inside the mount
+// point field of /proc/self/mountinfo.
+func unescapeMountField(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) {
+			c1, c2, c3 := s[i+1], s[i+2], s[i+3]
+			if c1 >= '0' && c1 <= '7' && c2 >= '0' && c2 <= '7' && c3 >= '0' && c3 <= '7' {
+				b.WriteByte((c1-'0')<<6 | (c2-'0')<<3 | (c3 - '0'))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func setupSandboxRuntimeFiles(sandboxPath string) {
+	for _, path := range []string{"/etc/resolv.conf", "/etc/hosts", "/etc/hostname"} {
+		util.AddToDefaultIgnoreList(util.IgnoreListEntry{
+			Path:            path,
+			PrefixMatchOnly: false,
+		})
+		if err := copySandboxRuntimeFile(path, sandboxPath); err != nil {
+			logrus.Debugf("Not copying runtime file %s into sandbox: %v", path, err)
+		}
+	}
+}
+
+func copySandboxRuntimeFile(path, sandboxPath string) error {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	dest := filepath.Join(sandboxPath, strings.TrimPrefix(filepath.Clean(path), string(os.PathSeparator)))
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(dest, contents, 0o644)
 }
 
 // checkKanikoDir will check whether the executor is operating in the default '/kaniko' directory,
@@ -485,6 +918,7 @@ func exit(err error) {
 
 // exits with the given error and exit code
 func exitWithCode(err error, exitCode int) {
+	teardownSandboxIfActive()
 	fmt.Fprintln(os.Stderr, err)
 	os.Exit(exitCode)
 }

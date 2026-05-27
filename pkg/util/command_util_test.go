@@ -19,12 +19,15 @@ package util
 import (
 	"fmt"
 	"io/fs"
+	"os"
 	"os/user"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
 	"testing"
 
+	"github.com/GoogleContainerTools/kaniko/pkg/config"
 	"github.com/GoogleContainerTools/kaniko/testutil"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
@@ -206,6 +209,26 @@ func Test_DestinationFilepath(t *testing.T) {
 		actualFilepath, err := DestinationFilepath(test.src, test.dest, test.cwd)
 		testutil.CheckErrorAndDeepEqual(t, false, err, test.expectedFilepath, actualFilepath)
 	}
+}
+
+func Test_DestinationFilepathWithSandboxRoot(t *testing.T) {
+	originalRootDir := config.RootDir
+	defer func() {
+		config.RootDir = originalRootDir
+	}()
+
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.RootDir = root
+
+	if err := os.MkdirAll(filepath.Join(root, "app"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	actualFilepath, err := DestinationFilepath("context/foo", "/app/", "/")
+	testutil.CheckErrorAndDeepEqual(t, false, err, filepath.Join(root, "app", "foo"), actualFilepath)
 }
 
 var urlDestFilepathTests = []struct {

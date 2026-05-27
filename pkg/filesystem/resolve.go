@@ -19,6 +19,7 @@ package filesystem
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/GoogleContainerTools/kaniko/pkg/config"
 	"github.com/GoogleContainerTools/kaniko/pkg/util"
@@ -64,7 +65,7 @@ func ResolvePaths(paths []string, wl []util.IgnoreListEntry) (pathsToAdd []strin
 
 		// If the path is a symlink we need to also consider the target of that
 		// link
-		evaled, e = filepath.EvalSymlinks(f)
+		evaled, e = evalSymlinksInRoot(f)
 		if e != nil {
 			if !os.IsNotExist(e) {
 				logrus.Errorf("Couldn't eval %s with link %s", f, link)
@@ -128,6 +129,9 @@ func resolveSymlinkAncestor(path string) (string, error) {
 	if !filepath.IsAbs(path) {
 		return "", errors.New("dest path must be abs")
 	}
+	if filepath.Clean(config.RootDir) != "/" {
+		return resolveSymlinkAncestorInRoot(path)
+	}
 
 	last := ""
 	newPath := filepath.Clean(path)
@@ -162,4 +166,55 @@ loop:
 	}
 	newPath = filepath.Join(newPath, last)
 	return filepath.Clean(newPath), nil
+}
+
+func resolveSymlinkAncestorInRoot(path string) (string, error) {
+	root := filepath.Clean(config.RootDir)
+	newPath := filepath.Clean(path)
+	if !util.HasFilepathPrefix(newPath, root, false) {
+		return "", errors.Errorf("path %s is outside root %s", newPath, root)
+	}
+	rel, err := filepath.Rel(root, newPath)
+	if err != nil {
+		return "", err
+	}
+	current := root
+	if rel == "." {
+		return current, nil
+	}
+	for _, part := range splitPath(rel) {
+		current = filepath.Join(current, part)
+		fi, err := os.Lstat(current)
+		if err != nil {
+			return "", errors.Wrap(err, "resolvePaths: failed to lstat")
+		}
+		if util.IsSymlink(fi) {
+			return current, nil
+		}
+	}
+	return newPath, nil
+}
+
+func evalSymlinksInRoot(path string) (string, error) {
+	if filepath.Clean(config.RootDir) == "/" {
+		return filepath.EvalSymlinks(path)
+	}
+	resolved, err := util.ResolvePathInRoot(path)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Lstat(resolved); err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
+func splitPath(path string) []string {
+	var parts []string
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
+		if part != "" && part != "." {
+			parts = append(parts, part)
+		}
+	}
+	return parts
 }

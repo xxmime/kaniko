@@ -82,7 +82,7 @@ func (c *CopyCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.Bu
 		}
 		cwd := config.WorkingDir
 		if cwd == "" {
-			cwd = kConfig.RootDir
+			cwd = "/"
 		}
 
 		destPath, err := util.DestinationFilepath(fullPath, dest, cwd)
@@ -236,6 +236,9 @@ func (cr *CachingCopyCommand) From() string {
 func resolveIfSymlink(destPath string) (string, error) {
 	if !filepath.IsAbs(destPath) {
 		return "", errors.New("dest path must be abs")
+	}
+	if filepath.Clean(kConfig.RootDir) != "/" {
+		return util.ResolvePathInRoot(destPath)
 	}
 
 	var nonexistentPaths []string

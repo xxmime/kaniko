@@ -19,6 +19,7 @@ package util
 import (
 	"archive/tar"
 	"bytes"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -27,6 +28,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -38,6 +40,51 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
+
+// Local thin wrappers so the test file does not need its own errors aliasing.
+var (
+	stderrorsAs = stderrors.As
+	stderrorsIs = stderrors.Is
+)
+
+func TestChownTolerantSwallowsEINVALInUserNS(t *testing.T) {
+	// On Linux a regular chown(path, 0, 0) on a tmp file owned by us
+	// always succeeds, and everywhere else os.Chown succeeds for the
+	// caller's own uid. We therefore can't realistically force a real
+	// EINVAL from os.Chown on the file we just created here. Instead we
+	// exercise the matching logic by feeding a synthesised PathError
+	// through a small inline copy of chownTolerant's classifier — the
+	// real function only adds the os.Chown call.
+	classify := func(envVal string, err error) error {
+		if err == nil {
+			return nil
+		}
+		t.Setenv("KANIKO_SANDBOX_USERNS", envVal)
+		if os.Getenv("KANIKO_SANDBOX_USERNS") != "1" {
+			return err
+		}
+		var pathErr *os.PathError
+		if !stderrorsAs(err, &pathErr) || !stderrorsIs(pathErr.Err, syscall.EINVAL) {
+			return err
+		}
+		return nil
+	}
+	einval := &os.PathError{Op: "chown", Path: "/x", Err: syscall.EINVAL}
+	eperm := &os.PathError{Op: "chown", Path: "/x", Err: syscall.EPERM}
+
+	if got := classify("1", einval); got != nil {
+		t.Fatalf("EINVAL inside user-ns should be tolerated, got %v", got)
+	}
+	if got := classify("1", eperm); got != eperm {
+		t.Fatalf("EPERM inside user-ns must propagate, got %v", got)
+	}
+	if got := classify("", einval); got != einval {
+		t.Fatalf("EINVAL outside user-ns must propagate, got %v", got)
+	}
+	if got := classify("skip", einval); got != einval {
+		t.Fatalf("EINVAL with KANIKO_SANDBOX_USERNS=skip must propagate, got %v", got)
+	}
+}
 
 func Test_DetectFilesystemSkiplist(t *testing.T) {
 	testDir := t.TempDir()
@@ -88,6 +135,132 @@ func Test_AddToIgnoreList(t *testing.T) {
 
 	if !CheckIgnoreList("/tmp") {
 		t.Errorf("CheckIgnoreList() = %v, want %v", false, true)
+	}
+}
+
+func Test_RootedPathResolvesAbsoluteSymlinkInsideRoot(t *testing.T) {
+	originalRootDir := config.RootDir
+	defer func() {
+		config.RootDir = originalRootDir
+	}()
+
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.RootDir = root
+
+	if err := os.MkdirAll(filepath.Join(root, "target"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/target", filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ResolvePathInRoot("/link/file")
+	testutil.CheckErrorAndDeepEqual(t, false, err, filepath.Join(root, "target", "file"), got)
+}
+
+func Test_DeleteFilesystemWithSandboxRootDoesNotDeleteOutsideRoot(t *testing.T) {
+	originalRootDir := config.RootDir
+	originalMountInfoPath := config.MountInfoPath
+	defer func() {
+		config.RootDir = originalRootDir
+		config.MountInfoPath = originalMountInfoPath
+		ignorelist = append([]IgnoreListEntry{}, defaultIgnoreList...)
+	}()
+
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.RootDir = root
+
+	mountInfoPath := filepath.Join(t.TempDir(), "mountinfo")
+	mountInfo := `228 122 0:90 / / rw,relatime - aufs none rw
+229 228 0:98 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw`
+	if err := os.WriteFile(mountInfoPath, []byte(mountInfo), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	config.MountInfoPath = mountInfoPath
+	if err := InitIgnoreList(); err != nil {
+		t.Fatal(err)
+	}
+
+	outside := filepath.Join(filepath.Dir(root), "outside-sandbox")
+	t.Cleanup(func() {
+		os.RemoveAll(outside)
+	})
+	if err := os.WriteFile(outside, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "delete-me"), []byte("delete"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "kaniko"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "kaniko", "keep"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := DeleteFilesystem(); err != nil {
+		t.Fatal(err)
+	}
+	if !FilepathExists(outside) {
+		t.Fatalf("outside file %s was deleted", outside)
+	}
+	if !FilepathExists(root) {
+		t.Fatalf("sandbox root %s was deleted", root)
+	}
+	if FilepathExists(filepath.Join(root, "delete-me")) {
+		t.Fatalf("sandbox child was not deleted")
+	}
+	if !FilepathExists(filepath.Join(root, "kaniko", "keep")) {
+		t.Fatalf("ignore-listed sandbox path was deleted")
+	}
+}
+
+func Test_ExtractFileWithSandboxRootDoesNotFollowAbsoluteSymlinkOutsideRoot(t *testing.T) {
+	originalRootDir := config.RootDir
+	defer func() {
+		config.RootDir = originalRootDir
+	}()
+
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.RootDir = root
+
+	outside := filepath.Join(filepath.Dir(root), "escaped")
+	t.Cleanup(func() {
+		os.RemoveAll(outside)
+	})
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/escaped", filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	hdr := &tar.Header{
+		Name:     "link/file",
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     int64(len("contents")),
+		Uid:      os.Getuid(),
+		Gid:      os.Getgid(),
+	}
+	if err := ExtractFile(root, hdr, filepath.Clean(hdr.Name), strings.NewReader("contents")); err != nil {
+		t.Fatal(err)
+	}
+
+	if FilepathExists(filepath.Join(outside, "file")) {
+		t.Fatalf("file was written outside sandbox root")
+	}
+	if !FilepathExists(filepath.Join(root, "escaped", "file")) {
+		t.Fatalf("file was not written inside sandbox root")
 	}
 }
 

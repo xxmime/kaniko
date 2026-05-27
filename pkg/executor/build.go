@@ -842,11 +842,17 @@ func filesToSave(deps []string) ([]string, error) {
 				if err != nil {
 					return nil, errors.Wrap(err, fmt.Sprintf("could not find relative path to %s", config.RootDir))
 				}
+				if strings.HasPrefix(link, ".."+string(os.PathSeparator)) || link == ".." {
+					return nil, errors.Errorf("resolved symlink %s escapes root %s", f, config.RootDir)
+				}
 				srcFiles = append(srcFiles, link)
 			}
 			f, err = filepath.Rel(config.RootDir, f)
 			if err != nil {
 				return nil, errors.Wrap(err, fmt.Sprintf("could not find relative path to %s", config.RootDir))
+			}
+			if strings.HasPrefix(f, ".."+string(os.PathSeparator)) || f == ".." {
+				return nil, errors.Errorf("resolved file %s escapes root %s", f, config.RootDir)
 			}
 			srcFiles = append(srcFiles, f)
 		}

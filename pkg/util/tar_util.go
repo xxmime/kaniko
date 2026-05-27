@@ -102,14 +102,7 @@ func (t *Tar) AddFileToTar(p string) error {
 		return err
 	}
 
-	if p == config.RootDir {
-		// allow entry for / to preserve permission changes etc. (currently ignored anyway by Docker runtime)
-		hdr.Name = "/"
-	} else {
-		// Docker uses no leading / in the tarball
-		hdr.Name = strings.TrimPrefix(p, config.RootDir)
-		hdr.Name = strings.TrimLeft(hdr.Name, "/")
-	}
+	hdr.Name = tarPathFromRoot(p)
 	if hdr.Typeflag == tar.TypeDir && !strings.HasSuffix(hdr.Name, "/") {
 		hdr.Name = hdr.Name + "/"
 	}
@@ -122,7 +115,7 @@ func (t *Tar) AddFileToTar(p string) error {
 
 	hardlink, linkDst := t.checkHardlink(p, i)
 	if hardlink {
-		hdr.Linkname = linkDst
+		hdr.Linkname = tarPathFromRoot(linkDst)
 		hdr.Typeflag = tar.TypeLink
 		hdr.Size = 0
 	}
@@ -179,12 +172,11 @@ func readSecurityXattrToTarHeader(path string, hdr *tar.Header) error {
 }
 
 func (t *Tar) Whiteout(p string) error {
-	dir := filepath.Dir(p)
-	name := archive.WhiteoutPrefix + filepath.Base(p)
+	name := filepath.Join(filepath.Dir(p), archive.WhiteoutPrefix+filepath.Base(p))
 
 	th := &tar.Header{
 		// Docker uses no leading / in the tarball
-		Name: strings.TrimLeft(filepath.Join(dir, name), "/"),
+		Name: strings.TrimLeft(tarPathFromRoot(name), "/"),
 		Size: 0,
 	}
 	if err := t.w.WriteHeader(th); err != nil {
@@ -192,6 +184,22 @@ func (t *Tar) Whiteout(p string) error {
 	}
 
 	return nil
+}
+
+func tarPathFromRoot(p string) string {
+	root := filepath.Clean(config.RootDir)
+	path := filepath.Clean(p)
+	if path == root {
+		// allow entry for / to preserve permission changes etc. (currently ignored anyway by Docker runtime)
+		return "/"
+	}
+	if root != string(os.PathSeparator) {
+		if rel, err := filepath.Rel(root, path); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return strings.TrimLeft(rel, "/")
+		}
+	}
+	// Docker uses no leading / in the tarball
+	return strings.TrimLeft(path, "/")
 }
 
 // Returns true if path is hardlink, and the link destination

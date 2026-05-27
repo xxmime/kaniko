@@ -176,6 +176,13 @@ func IsDestDir(path string) bool {
 	return fileInfo.IsDir()
 }
 
+func isDestDirInRoot(path string) bool {
+	if filepath.Clean(config.RootDir) == pathSeparator {
+		return IsDestDir(path)
+	}
+	return strings.HasSuffix(path, pathSeparator) || path == "." || IsDestDir(RootedPath(path))
+}
+
 // DestinationFilepath returns the destination filepath from the build context to the image filesystem
 // If source is a file:
 //
@@ -190,6 +197,9 @@ func IsDestDir(path string) bool {
 func DestinationFilepath(src, dest, cwd string) (string, error) {
 	_, srcFileName := filepath.Split(src)
 	newDest := dest
+	if cwd == "" {
+		cwd = pathSeparator
+	}
 
 	if !filepath.IsAbs(newDest) {
 		newDest = filepath.Join(cwd, newDest)
@@ -198,7 +208,7 @@ func DestinationFilepath(src, dest, cwd string) (string, error) {
 			newDest += pathSeparator
 		}
 	}
-	if IsDestDir(newDest) {
+	if isDestDirInRoot(newDest) {
 		newDest = filepath.Join(newDest, srcFileName)
 	}
 
@@ -206,16 +216,26 @@ func DestinationFilepath(src, dest, cwd string) (string, error) {
 		newDest += pathSeparator
 	}
 
-	return newDest, nil
+	rootedDest, err := ResolvePathInRoot(newDest)
+	if err != nil {
+		return "", err
+	}
+	if strings.HasSuffix(newDest, pathSeparator) && !strings.HasSuffix(rootedDest, pathSeparator) {
+		rootedDest += pathSeparator
+	}
+	return rootedDest, nil
 }
 
 // URLDestinationFilepath gives the destination a file from a remote URL should be saved to
 func URLDestinationFilepath(rawurl, dest, cwd string, envs []string) (string, error) {
-	if !IsDestDir(dest) {
+	if cwd == "" {
+		cwd = pathSeparator
+	}
+	if !isDestDirInRoot(dest) {
 		if !filepath.IsAbs(dest) {
-			return filepath.Join(cwd, dest), nil
+			return ResolvePathInRoot(filepath.Join(cwd, dest))
 		}
-		return dest, nil
+		return ResolvePathInRoot(dest)
 	}
 
 	urlBase, err := ResolveEnvironmentReplacement(rawurl, envs, true)
@@ -233,7 +253,7 @@ func URLDestinationFilepath(rawurl, dest, cwd string, envs []string) (string, er
 	if !filepath.IsAbs(dest) {
 		destPath = filepath.Join(cwd, destPath)
 	}
-	return destPath, nil
+	return ResolvePathInRoot(destPath)
 }
 
 func IsSrcsValid(srcsAndDest instructions.SourcesAndDest, resolvedSources []string, fileContext FileContext) error {
@@ -248,7 +268,7 @@ func IsSrcsValid(srcsAndDest instructions.SourcesAndDest, resolvedSources []stri
 			}
 			totalSrcs++
 		}
-		if totalSrcs > 1 && !IsDestDir(dest) {
+		if totalSrcs > 1 && !isDestDirInRoot(dest) {
 			return errors.New("when specifying multiple sources in a COPY command, destination must be a directory and end in '/'")
 		}
 	}
@@ -293,7 +313,7 @@ func IsSrcsValid(srcsAndDest instructions.SourcesAndDest, resolvedSources []stri
 	}
 	// If there are wildcards, and the destination is a file, there must be exactly one file to copy over,
 	// Otherwise, return an error
-	if !IsDestDir(dest) && totalFiles > 1 {
+	if !isDestDirInRoot(dest) && totalFiles > 1 {
 		return errors.New("when specifying multiple sources in a COPY command, destination must be a directory and end in '/'")
 	}
 	return nil

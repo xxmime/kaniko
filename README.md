@@ -108,6 +108,7 @@ _If you are interested in contributing to kaniko, see
       - [Flag `--registry-mirror`](#flag---registry-mirror)
       - [Flag `--skip-default-registry-fallback`](#flag---skip-default-registry-fallback)
       - [Flag `--reproducible`](#flag---reproducible)
+      - [Flag `--sandbox`](#flag---sandbox)
       - [Flag `--single-snapshot`](#flag---single-snapshot)
       - [Flag `--skip-push-permission-check`](#flag---skip-push-permission-check)
       - [Flag `--skip-tls-verify`](#flag---skip-tls-verify)
@@ -1072,6 +1073,79 @@ is ignored.
 
 Set this flag to strip timestamps out of the built image and make it
 reproducible.
+
+#### Flag `--sandbox`
+
+Set this flag to build the image filesystem under `/kaniko/sandbox` instead of
+the container root filesystem. In sandbox mode, filesystem extraction, COPY/ADD,
+WORKDIR, RUN execution, snapshotting, and cleanup are rooted in the sandbox so
+build steps do not delete or overwrite files from the original root filesystem.
+
+When sandbox mode is enabled kaniko `chroot`s into `/kaniko/sandbox` for every
+`RUN` command and bind-mounts the host's `/proc`, `/sys` and `/dev` into the
+sandbox so tools that resolve their own location through `/proc/self/exe`
+(e.g. `zig`, `python`, `go`, glibc's loader) and tools that read `/dev/null`,
+`/dev/urandom`, etc. continue to work. The bind-mounts are immediately made
+`MS_PRIVATE` so that a later unmount cannot propagate back to the host's
+`/proc`, `/sys`, `/dev`. kaniko also installs a `SIGINT`/`SIGTERM` handler
+that lazily detaches these mounts when the process is cancelled, so a
+crashed CI run does not leave dangling bind-mounts on the host.
+
+kaniko also copies `/etc/resolv.conf`, `/etc/hosts` and `/etc/hostname` into
+the sandbox so DNS resolution works inside the chroot. These runtime files
+and bind-mount points are added to the ignore list and are **not** committed
+to the resulting image.
+
+Because of the bind-mounts and the `chroot`, `--sandbox` requires either
+host-level `CAP_SYS_ADMIN` + `CAP_SYS_CHROOT` (the defaults when running
+kaniko as root in a standard Docker / Kubernetes container) **or** support
+for unprivileged user namespaces.
+
+If kaniko detects that it does **not** have `CAP_SYS_ADMIN` in its current
+namespace it will automatically re-exec itself inside a fresh user + mount
+namespace where it gains full capabilities with respect to that namespace,
+which is enough to bind-mount `/proc`, `/sys` and `/dev`. The kernel
+destroys the namespace (and all its mounts) when the child exits, so
+nothing is leaked back to the host.
+
+The auto-re-exec uses the standard rootless-container pattern (`CLONE_NEWUSER
+| CLONE_NEWNS` with a `0 <uid> 1` mapping) and works in any environment that:
+
+- has `kernel.unprivileged_userns_clone = 1` (default on most modern
+  distros, including GitHub Actions Ubuntu runners), and
+- does not block the `unshare(CLONE_NEWUSER)` syscall via seccomp / LSM.
+
+You can opt out of the fallback by setting `KANIKO_SANDBOX_USERNS=skip`,
+which is useful if you are sure you have `CAP_SYS_ADMIN` but
+`/proc/self/status` reports otherwise (e.g. in some restricted container
+runtimes). In that mode, if mounts fail, RUN commands that need
+`/proc/self/exe` (e.g. `zig build`) will fail with `error: FileNotFound`
+and you will see a warning like:
+
+```
+WARN ... Sandbox: bind-mount /proc -> /kaniko/sandbox/proc failed (RUN
+commands relying on /proc may fail with FileNotFound; ensure the kaniko
+container has CAP_SYS_ADMIN): operation not permitted
+```
+
+The contents of `/kaniko/sandbox` are wiped at the **start** and **end** of
+every kaniko invocation (including after a successful build/push and on
+failure or SIGINT/SIGTERM), so do not store anything there.
+
+**Known limitations** of the auto-re-exec path:
+
+- When kaniko runs as **root** (the usual case in Docker / GitHub Actions),
+  the re-exec maps container uids/gids `0-65535` 1:1 to the host, which
+  covers typical `adduser` / `chown` RUN steps and base-layer tar entries
+  such as alpine's `/etc/shadow` (`gid=42`).
+
+- When kaniko runs as a **non-root** uid, only that single uid/gid is mapped
+  to container `0`. `RUN adduser` or `chown` to other users will fail with
+  `EINVAL`. During base-layer unpack, kaniko downgrades unmapped `chown`
+  `EINVAL` to a warning so extraction can continue; unmodified base layers
+  still preserve ownership in the final image. For non-root kaniko with
+  `RUN` steps that create users, use real `CAP_SYS_ADMIN` or configure
+  `/etc/subuid` / `/etc/subgid` with `newuidmap` / `newgidmap`.
 
 #### Flag `--single-snapshot`
 
