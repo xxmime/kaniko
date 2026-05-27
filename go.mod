@@ -1,4 +1,4 @@
-module github.com/GoogleContainerTools/kaniko
+module github.com/xxmime/kaniko
 
 go 1.24.0
 

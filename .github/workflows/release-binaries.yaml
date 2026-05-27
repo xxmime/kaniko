@@ -1,0 +1,53 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+    branches: 
+      - main
+
+permissions:
+  contents: write  # Required for creating releases
+
+jobs:
+  release-binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+          - os: linux
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v5 # v3
+
+      - uses: actions/setup-go@v5 # v4.01
+        with:
+          go-version: '1.22'
+
+      - name: Build binaries
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          make out/executor
+          version_name="latest"
+          if [ ! "${{github.ref_name}}" = "main" ]; then 
+            version_name="${{github.ref_name}}"
+          fi
+
+          # Create archives
+          tar cvf kaniko-${{ matrix.os }}-${{ matrix.arch }}-${version_name}.tar.gz out/executor
+          
+          # Calculate checksums
+          sha256sum kaniko-${{ matrix.os }}-${{ matrix.arch }}-${version_name}.tar.gz > kaniko-${{ matrix.os }}-${{ matrix.arch }}-${version_name}.tar.gz.sha256
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            kaniko-executor-${{ matrix.os }}-${{ matrix.arch }}-*.tar.gz
+            kaniko-executor-${{ matrix.os }}-${{ matrix.arch }}-*.tar.gz.sha256
+          generate_release_notes: true
