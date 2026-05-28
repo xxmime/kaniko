@@ -21,7 +21,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/GoogleContainerTools/kaniko/testutil"
+	"github.com/xxmime/kaniko/testutil"
 )
 
 func TestSkipPath(t *testing.T) {

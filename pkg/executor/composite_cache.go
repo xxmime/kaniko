@@ -23,7 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/GoogleContainerTools/kaniko/pkg/util"
+	"github.com/xxmime/kaniko/pkg/util"
 	"github.com/pkg/errors"
 )
 

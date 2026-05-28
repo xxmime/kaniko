@@ -23,7 +23,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/GoogleContainerTools/kaniko/pkg/util"
+	"github.com/xxmime/kaniko/pkg/util"
 )
 
 func Test_NewCompositeCache(t *testing.T) {
