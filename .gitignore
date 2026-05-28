@@ -6,3 +6,11 @@ BUILD.bazel
 *.iml
 .vagrant
 .vscode/
+**/*_test.go
+*.json
+*.log
+*.md
+executor
+main
+.gitignore
+target

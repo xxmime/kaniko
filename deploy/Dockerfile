@@ -28,6 +28,9 @@ ENV GOBIN=/usr/local/bin
 # Add .docker config dir
 RUN mkdir -p /kaniko/.docker
 
+# Install UPX for binary compression (~70% size reduction)
+RUN apt-get update && apt-get install -y --no-install-recommends upx-ucl && rm -rf /var/lib/apt/lists/*
+
 COPY . .
 
 #  dependencies https://github.com/golang/go/issues/48332

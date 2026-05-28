@@ -34,12 +34,18 @@ GO_FILES := $(shell find . -type f -name '*.go' -not -path "./vendor/*")
 GO_LDFLAGS := '-extldflags "-static"
 GO_LDFLAGS += -X $(VERSION_PACKAGE).version=$(VERSION)
 GO_LDFLAGS += -w -s # Drop debugging symbols.
+GO_LDFLAGS += -buildid= # Remove build ID for reproducible builds.
 GO_LDFLAGS += '
 
 EXECUTOR_PACKAGE = $(REPOPATH)/cmd/executor
 WARMER_PACKAGE = $(REPOPATH)/cmd/warmer
 KANIKO_PROJECT = $(REPOPATH)/kaniko
 BUILD_ARG ?=
+
+# UPX compression for binary size reduction (~70% smaller).
+# Set COMPRESS=0 to disable. Requires UPX installed on the build host.
+COMPRESS ?= 1
+UPX_LEVEL ?= -7
 
 # Force using Go Modules and always read the dependencies from
 # the `vendor` folder.
@@ -48,10 +54,18 @@ export GOFLAGS = -mod=vendor
 
 
 out/executor: $(GO_FILES)
-	GOARCH=$(GOARCH) GOOS=$(GOOS) CGO_ENABLED=0 go build -ldflags $(GO_LDFLAGS) -o $@ $(EXECUTOR_PACKAGE)
+	GOARCH=$(GOARCH) GOOS=$(GOOS) CGO_ENABLED=0 go build -trimpath -ldflags $(GO_LDFLAGS) -o $@ $(EXECUTOR_PACKAGE)
+	@if [ "$(COMPRESS)" = "1" ]; then \
+		echo "Compressing $@ with UPX..."; \
+		upx $(UPX_LEVEL) $@; \
+	fi
 
 out/warmer: $(GO_FILES)
-	GOARCH=$(GOARCH) GOOS=$(GOOS) CGO_ENABLED=0 go build -ldflags $(GO_LDFLAGS) -o $@ $(WARMER_PACKAGE)
+	GOARCH=$(GOARCH) GOOS=$(GOOS) CGO_ENABLED=0 go build -trimpath -ldflags $(GO_LDFLAGS) -o $@ $(WARMER_PACKAGE)
+	@if [ "$(COMPRESS)" = "1" ]; then \
+		echo "Compressing $@ with UPX..."; \
+		upx $(UPX_LEVEL) $@; \
+	fi
 
 .PHONY: install-container-diff
 install-container-diff:
