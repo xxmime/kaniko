@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"os"
 
-	kConfig "github.com/GoogleContainerTools/kaniko/pkg/config"
-	"github.com/GoogleContainerTools/kaniko/pkg/util"
+	kConfig "github.com/xxmime/kaniko/pkg/config"
+	"github.com/xxmime/kaniko/pkg/util"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )

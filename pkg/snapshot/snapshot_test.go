@@ -25,9 +25,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/GoogleContainerTools/kaniko/pkg/config"
-	"github.com/GoogleContainerTools/kaniko/pkg/util"
-	"github.com/GoogleContainerTools/kaniko/testutil"
+	"github.com/xxmime/kaniko/pkg/config"
+	"github.com/xxmime/kaniko/pkg/util"
+	"github.com/xxmime/kaniko/testutil"
 	"github.com/pkg/errors"
 )
 

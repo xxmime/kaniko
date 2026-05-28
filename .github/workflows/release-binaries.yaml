@@ -10,6 +10,10 @@ on:
 permissions:
   contents: write  # Required for creating releases
 
+
+env:
+  VERSION_NAME: ${{ case(github.ref_name == 'main', 'latest', github.ref_name) }}
+
 jobs:
   release-binaries:
     runs-on: ubuntu-latest
@@ -26,28 +30,34 @@ jobs:
       - uses: actions/setup-go@v5 # v4.01
         with:
           go-version: '1.22'
+      
+      - name: Install UPX
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          install-only: true
 
       - name: Build binaries
         env:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
+        # if: ${{ github.ref_name == 'main' }}
         run: |
           make out/executor
-          version_name="latest"
-          if [ ! "${{github.ref_name}}" = "main" ]; then 
-            version_name="${{github.ref_name}}"
-          fi
+
+          # compress upx 
+          upx -fq --ultra-brute out/executor
 
           # Create archives
-          tar cvf kaniko-${{ matrix.os }}-${{ matrix.arch }}-${version_name}.tar.gz out/executor
+          tar cvf kaniko-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION_NAME }}.tar.gz out/executor
           
           # Calculate checksums
-          sha256sum kaniko-${{ matrix.os }}-${{ matrix.arch }}-${version_name}.tar.gz > kaniko-${{ matrix.os }}-${{ matrix.arch }}-${version_name}.tar.gz.sha256
+          sha256sum kaniko-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION_NAME }}.tar.gz > kaniko-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION_NAME }}.tar.gz.sha256
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            kaniko-executor-${{ matrix.os }}-${{ matrix.arch }}-*.tar.gz
-            kaniko-executor-${{ matrix.os }}-${{ matrix.arch }}-*.tar.gz.sha256
+            kaniko-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION_NAME }}.tar.gz
+            kaniko-${{ matrix.os }}-${{ matrix.arch }}-${{ env.VERSION_NAME }}.tar.gz.sha256
           generate_release_notes: true
+          tag_name: ${{ env.VERSION_NAME }}

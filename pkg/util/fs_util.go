@@ -33,8 +33,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/GoogleContainerTools/kaniko/pkg/config"
-	"github.com/GoogleContainerTools/kaniko/pkg/timing"
+	"github.com/xxmime/kaniko/pkg/config"
+	"github.com/xxmime/kaniko/pkg/timing"
 	securejoin "github.com/cyphar/filepath-securejoin"
 	"github.com/docker/docker/pkg/archive"
 	v1 "github.com/google/go-containerregistry/pkg/v1"

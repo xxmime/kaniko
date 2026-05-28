@@ -183,6 +183,33 @@ Please see [References](#References) for more docs & video tutorials
 
 ## Using kaniko
 
+### Downloading Pre-built Binaries
+
+Pre-built binaries for kaniko are available for download from the [GitHub Releases](https://github.com/GoogleContainerTools/kaniko/releases) page. We provide binaries for:
+
+- **Linux**: amd64, arm64, s390x, ppc64le
+
+Each release includes:
+- `kaniko-executor` - The main kaniko executor binary
+- `kaniko-warmer` - The kaniko warmer binary
+- SHA256 checksums for verification
+
+To download and verify a binary:
+
+```bash
+# Download the binary and checksum for your platform
+wget https://github.com/GoogleContainerTools/kaniko/releases/download/v1.24.0/kaniko-executor-linux-amd64.tar.gz
+wget https://github.com/GoogleContainerTools/kaniko/releases/download/v1.24.0/kaniko-executor-linux-amd64.tar.gz.sha256
+
+# Verify the checksum
+sha256sum -c kaniko-executor-linux-amd64.tar.gz.sha256
+
+# Extract and use
+tar -xzf kaniko-executor-linux-amd64.tar.gz
+./out/executor --help
+```
+
+
 To use kaniko to build and push an image for you, you will need:
 
 1. A [build context](#kaniko-build-contexts), aka something to build
