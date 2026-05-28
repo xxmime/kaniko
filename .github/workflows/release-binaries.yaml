@@ -31,6 +31,7 @@ jobs:
         env:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
+        # if: ${{ github.ref_name == 'main' }}
         run: |
           make out/executor
           version_name="latest"
@@ -48,6 +49,6 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            kaniko-executor-${{ matrix.os }}-${{ matrix.arch }}-*.tar.gz
-            kaniko-executor-${{ matrix.os }}-${{ matrix.arch }}-*.tar.gz.sha256
+            kaniko-${{ matrix.os }}-${{ matrix.arch }}-*.tar.gz
+            kaniko-${{ matrix.os }}-${{ matrix.arch }}-*.tar.gz.sha256
           generate_release_notes: true

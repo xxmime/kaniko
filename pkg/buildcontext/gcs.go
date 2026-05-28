@@ -22,10 +22,10 @@ import (
 	"os"
 	"path/filepath"
 
-	kConfig "github.com/GoogleContainerTools/kaniko/pkg/config"
-	"github.com/GoogleContainerTools/kaniko/pkg/constants"
-	"github.com/GoogleContainerTools/kaniko/pkg/util"
-	"github.com/GoogleContainerTools/kaniko/pkg/util/bucket"
+	kConfig "github.com/xxmime/kaniko/pkg/config"
+	"github.com/xxmime/kaniko/pkg/constants"
+	"github.com/xxmime/kaniko/pkg/util"
+	"github.com/xxmime/kaniko/pkg/util/bucket"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )

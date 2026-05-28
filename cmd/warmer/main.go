@@ -19,7 +19,7 @@ package main
 import (
 	"os"
 
-	"github.com/GoogleContainerTools/kaniko/cmd/warmer/cmd"
+	"github.com/xxmime/kaniko/cmd/warmer/cmd"
 )
 
 func main() {
