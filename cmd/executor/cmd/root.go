@@ -30,6 +30,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containerd/containerd/platforms"
+	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/xxmime/kaniko/pkg/buildcontext"
 	"github.com/xxmime/kaniko/pkg/config"
 	"github.com/xxmime/kaniko/pkg/constants"
@@ -38,13 +45,6 @@ import (
 	"github.com/xxmime/kaniko/pkg/timing"
 	"github.com/xxmime/kaniko/pkg/util"
 	"github.com/xxmime/kaniko/pkg/util/proc"
-	"github.com/containerd/containerd/platforms"
-	"github.com/google/go-containerregistry/pkg/name"
-	v1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 	"golang.org/x/sys/unix"
 )
 
@@ -315,6 +315,12 @@ func addHiddenFlags(cmd *cobra.Command) {
 // CAP_SYS_ADMIN but lies in /proc/self/status, or for debugging).
 const sandboxUserNSEnvVar = "KANIKO_SANDBOX_USERNS"
 
+// Values written into KANIKO_SANDBOX_USERNS by reExecInUserNamespace.
+const (
+	sandboxUserNSFull = "1"      // child was started with CLONE_NEWUSER|CLONE_NEWNS
+	sandboxUserNSOnly = "userns" // child was started with CLONE_NEWUSER; must CLONE_NEWNS locally
+)
+
 func setupSandbox() error {
 	sandboxPath := filepath.Clean(constants.DefaultSandboxPath)
 	if sandboxPath == string(os.PathSeparator) || sandboxPath == "." {
@@ -338,12 +344,21 @@ func setupSandbox() error {
 	switch nsState {
 	case "":
 		if !hasCapSysAdmin() {
-			logrus.Info("Sandbox: CAP_SYS_ADMIN not available; re-executing inside a user+mount namespace so /proc, /sys, /dev can be bind-mounted (set KANIKO_SANDBOX_USERNS=skip to disable)")
-			return reExecInUserNamespace()
+			logrus.Info("Sandbox: CAP_SYS_ADMIN not available; re-executing inside a user namespace so /proc, /sys, /dev can be bind-mounted (set KANIKO_SANDBOX_USERNS=skip to disable)")
+			if err := reExecInUserNamespace(); err != nil {
+				logrus.Warnf("Sandbox: user-namespace re-exec unavailable (%v); continuing without it — bind-mounting /proc, /sys, /dev requires CAP_SYS_ADMIN or a working user namespace", err)
+			}
 		}
 	case "skip":
 		if !hasCapSysAdmin() {
 			logrus.Warn("Sandbox: CAP_SYS_ADMIN not available and user-namespace re-exec was skipped (KANIKO_SANDBOX_USERNS=skip); RUN commands that need /proc, /sys or /dev may fail with FileNotFound")
+		}
+	case sandboxUserNSFull:
+		logrus.Debug("Sandbox: running inside user+mount namespace re-exec child")
+	case sandboxUserNSOnly:
+		logrus.Debug("Sandbox: creating mount namespace inside user-namespace re-exec child")
+		if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+			logrus.Warnf("Sandbox: unshare(CLONE_NEWNS) failed after user-namespace re-exec: %v", err)
 		}
 	default:
 		logrus.Debugf("Sandbox: running inside user-namespace re-exec child (%s=%s)", sandboxUserNSEnvVar, nsState)
@@ -378,20 +393,22 @@ func setupSandbox() error {
 	return nil
 }
 
-// hasCapSysAdmin returns true if the calling process currently has
-// CAP_SYS_ADMIN in its effective capability set. We parse /proc/self/status
-// rather than calling capget() so the implementation stays vendor-free and
-// works the same way on every Linux kernel.
+const capSysAdminBit = 21 // CAP_SYS_ADMIN, see capabilities(7).
+
+// hasCapSysAdmin returns true when CAP_SYS_ADMIN is present in the effective
+// or permitted capability set. Some runtimes drop it from CapEff while leaving
+// it in CapPrm; checking both avoids a pointless user-namespace re-exec.
 func hasCapSysAdmin() bool {
-	const capSysAdminBit = 21 // CAP_SYS_ADMIN, see capabilities(7).
+	return capStatusHasSysAdmin("CapEff") || capStatusHasSysAdmin("CapPrm")
+}
+
+func capStatusHasSysAdmin(field string) bool {
 	data, err := os.ReadFile("/proc/self/status")
 	if err != nil {
-		// If /proc isn't readable we have bigger problems; assume no caps so
-		// we attempt the user-namespace path.
 		return false
 	}
+	prefix := field + ":"
 	for _, line := range strings.Split(string(data), "\n") {
-		const prefix = "CapEff:"
 		if !strings.HasPrefix(line, prefix) {
 			continue
 		}
@@ -423,46 +440,94 @@ func sandboxUserNamespaceIDMaps(callerUID, callerGID int) (uidMaps, gidMaps []sy
 		false
 }
 
-// reExecInUserNamespace forks a copy of /proc/self/exe inside a new user and
-// mount namespace, maps uids/gids into that namespace, and waits for it to
-// finish. The child process inherits a full capability set with respect to its
-// own user namespace, so it can bind-mount /proc, /sys and /dev into
-// /kaniko/sandbox without needing host-level CAP_SYS_ADMIN.
+type sandboxReExecStrategy struct {
+	name       string
+	cloneflags uintptr
+	nsEnvValue string
+	fullIDMap  bool
+}
+
+// reExecInUserNamespace tries several user-namespace strategies and re-executes
+// kaniko via /proc/self/exe. The child inherits a full capability set with
+// respect to its own user namespace, so it can bind-mount /proc, /sys and /dev
+// into /kaniko/sandbox without host-level CAP_SYS_ADMIN.
 //
 // On success this function does NOT return; it exits the parent with the
-// child's exit code. On failure to start the child (typically because
-// /proc/sys/kernel/unprivileged_userns_clone is 0 or seccomp blocks
-// unshare(CLONE_NEWUSER)) it returns an error so the caller can decide how
-// to surface it.
+// child's exit code. When every strategy fails it returns an error so the
+// caller can continue without user-namespace isolation.
 func reExecInUserNamespace() error {
-	exe, err := os.Readlink("/proc/self/exe")
-	if err != nil {
-		// Fall back to /proc/self/exe directly; exec(2) follows it.
-		exe = "/proc/self/exe"
+	strategies := []sandboxReExecStrategy{
+		{
+			name:       "user+mount namespace, full uid map",
+			cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+			nsEnvValue: sandboxUserNSFull,
+			fullIDMap:  true,
+		},
+		{
+			name:       "user namespace only, full uid map",
+			cloneflags: syscall.CLONE_NEWUSER,
+			nsEnvValue: sandboxUserNSOnly,
+			fullIDMap:  true,
+		},
+		{
+			name:       "user+mount namespace, single uid map",
+			cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+			nsEnvValue: sandboxUserNSFull,
+			fullIDMap:  false,
+		},
+		{
+			name:       "user namespace only, single uid map",
+			cloneflags: syscall.CLONE_NEWUSER,
+			nsEnvValue: sandboxUserNSOnly,
+			fullIDMap:  false,
+		},
 	}
-	cmd := exec.Command(exe, os.Args[1:]...)
-	cmd.Env = append(os.Environ(), sandboxUserNSEnvVar+"=1")
+	var parts []string
+	for _, s := range strategies {
+		if err := tryReExecInUserNamespace(s); err != nil {
+			logrus.Debugf("Sandbox: re-exec strategy %q failed: %v", s.name, err)
+			parts = append(parts, fmt.Sprintf("%s: %v", s.name, err))
+			continue
+		}
+	}
+	return errors.Errorf(
+		"all user-namespace re-exec strategies failed (%s); grant CAP_SYS_ADMIN to the kaniko container or enable unprivileged user namespaces",
+		strings.Join(parts, "; "),
+	)
+}
+
+func tryReExecInUserNamespace(s sandboxReExecStrategy) error {
+	// Always exec through /proc/self/exe. Resolving the path with readlink can
+	// point at a noexec mount or a location blocked by LSM/seccomp.
+	cmd := exec.Command("/proc/self/exe", os.Args[1:]...)
+	cmd.Env = append(os.Environ(), sandboxUserNSEnvVar+"="+s.nsEnvValue)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	uidMaps, gidMaps, enableSetgroups := sandboxUserNamespaceIDMaps(os.Getuid(), os.Getgid())
-	if enableSetgroups {
-		logrus.Infof("Sandbox: mapping uids/gids 0-%d 1:1 into user namespace (RUN adduser/chown supported)", sandboxStandardIDMapSize-1)
+
+	var uidMaps, gidMaps []syscall.SysProcIDMap
+	var enableSetgroups bool
+	if s.fullIDMap {
+		uidMaps, gidMaps, enableSetgroups = sandboxUserNamespaceIDMaps(os.Getuid(), os.Getgid())
+		if enableSetgroups {
+			logrus.Infof("Sandbox: trying %s — mapping uids/gids 0-%d 1:1", s.name, sandboxStandardIDMapSize-1)
+		} else {
+			logrus.Warnf("Sandbox: trying %s — mapping only container uid/gid 0 -> host %d/%d", s.name, os.Getuid(), os.Getgid())
+		}
 	} else {
-		logrus.Warnf("Sandbox: mapping only container uid/gid 0 -> host %d/%d; RUN adduser or chown to other users will fail with EINVAL", os.Getuid(), os.Getgid())
+		uidMaps = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}}
+		gidMaps = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}}
+		logrus.Infof("Sandbox: trying %s — mapping uid/gid 0 -> host %d/%d", s.name, os.Getuid(), os.Getgid())
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags:                 syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+		Cloneflags:                 s.cloneflags,
 		UidMappings:                uidMaps,
 		GidMappings:                gidMaps,
 		GidMappingsEnableSetgroups: enableSetgroups,
 	}
 
 	if err := cmd.Start(); err != nil {
-		return errors.Wrap(err,
-			"sandbox: cannot create user namespace (kernel may have disabled "+
-				"unprivileged user namespaces; check `sysctl kernel.unprivileged_userns_clone` "+
-				"and the seccomp profile, or set "+sandboxUserNSEnvVar+"=skip to disable this fallback)")
+		return err
 	}
 
 	// Forward common signals from the parent so e.g. CI cancellation kills
@@ -493,7 +558,7 @@ func reExecInUserNamespace() error {
 		if errors.As(waitErr, &exitErr) {
 			os.Exit(exitErr.ExitCode())
 		}
-		return errors.Wrap(waitErr, "sandbox: user-namespace child failed")
+		return waitErr
 	}
 	os.Exit(0)
 	return nil // unreachable; satisfies the compiler.
@@ -602,7 +667,10 @@ var sandboxKernelMounts = []struct {
 // own errors (typically "FileNotFound"). The warning makes that diagnosis
 // obvious.
 func mountSandboxKernelFilesystems(sandboxPath string) {
+	util.SandboxKernelFSBindMounted = false
+	util.SandboxProcSelfStub = false
 	mounted := make([]string, 0, len(sandboxKernelMounts))
+	mountedTargets := make(map[string]bool, len(sandboxKernelMounts))
 	for _, m := range sandboxKernelMounts {
 		target := filepath.Join(sandboxPath, m.target)
 
@@ -633,12 +701,20 @@ func mountSandboxKernelFilesystems(sandboxPath string) {
 			logrus.Warnf("Sandbox: could not make %s private (host propagation risk): %v", target, err)
 		}
 		mounted = append(mounted, target)
+		mountedTargets[m.target] = true
 		logrus.Infof("Sandbox: bind-mounted %s into %s", m.source, target)
 	}
 	if len(mounted) > 0 {
 		logrus.Infof("Sandbox: %d kernel filesystem(s) bind-mounted: %s", len(mounted), strings.Join(mounted, ", "))
-	} else {
-		logrus.Warn("Sandbox: no kernel filesystems were bind-mounted; RUN commands that need /proc, /sys or /dev (e.g. tools that read /proc/self/exe like zig, python, glibc loader) may fail with FileNotFound")
+	}
+	util.SandboxKernelFSBindMounted = len(mounted) == len(sandboxKernelMounts)
+	needProc := !mountedTargets["proc"]
+	needSys := !mountedTargets["sys"]
+	needDev := !mountedTargets["dev"]
+	if needProc || needSys || needDev {
+		if err := util.SetupSandboxStubKernelFilesystems(sandboxPath, needProc, needSys, needDev); err != nil {
+			logrus.Warnf("Sandbox: failed to set up stub kernel filesystems: %v", err)
+		}
 	}
 }
 

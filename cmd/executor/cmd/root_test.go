@@ -140,22 +140,22 @@ func TestSandboxUserNamespaceIDMaps(t *testing.T) {
 	}
 }
 
-func TestHasCapSysAdminParsesCapEff(t *testing.T) {
-	// We can't reasonably alter /proc/self/status from a test, but the
-	// parser is the interesting part. Reproduce the kernel format and
-	// confirm we extract CAP_SYS_ADMIN (bit 21 == 0x200000) correctly.
-	parse := func(capEff string) bool {
+func TestCapStatusHasSysAdminParsesStatus(t *testing.T) {
+	parse := func(field, capVal string) bool {
 		lines := []string{
 			"Name:\tkaniko",
 			"Uid:\t0\t0\t0\t0",
-			"CapEff:\t" + capEff,
+			"CapEff:\t0000000000000000",
+			"CapPrm:\t0000000000000000",
+			field + ":\t" + capVal,
 			"Seccomp:\t0",
 		}
+		prefix := field + ":"
 		for _, line := range lines {
-			if !strings.HasPrefix(line, "CapEff:") {
+			if !strings.HasPrefix(line, prefix) {
 				continue
 			}
-			val, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "CapEff:")), 16, 64)
+			val, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, prefix)), 16, 64)
 			if err != nil {
 				return false
 			}
@@ -165,18 +165,20 @@ func TestHasCapSysAdminParsesCapEff(t *testing.T) {
 	}
 
 	cases := []struct {
-		capEff string
+		field  string
+		capVal string
 		want   bool
 	}{
-		{"0000000000000000", false},
-		{"0000000000200000", true},                  // exactly CAP_SYS_ADMIN
-		{"00000000a80425fb", true},                  // typical "all caps" set on root
-		{"0000000000000800", false},                 // CAP_NET_ADMIN only
-		{"00000000003fffffffff", true},              // wider set, still includes bit 21
+		{"CapEff", "0000000000000000", false},
+		{"CapEff", "0000000000200000", true},
+		{"CapEff", "00000000a80425fb", true},
+		{"CapEff", "0000000000000800", false},
+		{"CapPrm", "0000000000200000", true},
+		{"CapPrm", "0000000000000000", false},
 	}
 	for _, c := range cases {
-		t.Run(c.capEff, func(t *testing.T) {
-			testutil.CheckDeepEqual(t, c.want, parse(c.capEff))
+		t.Run(c.field+"_"+c.capVal, func(t *testing.T) {
+			testutil.CheckDeepEqual(t, c.want, parse(c.field, c.capVal))
 		})
 	}
 }
@@ -192,8 +194,8 @@ func TestUnescapeMountField(t *testing.T) {
 		{`/path/with\011tab`, "/path/with\ttab"},
 		{`/path/with\012newline`, "/path/with\nnewline"},
 		{`/path/with\134backslash`, `/path/with\backslash`},
-		{`/edge\999case`, `/edge\999case`},   // not a valid octal triple, kept as-is
-		{`/short\04`, `/short\04`},            // too short to be a full escape
+		{`/edge\999case`, `/edge\999case`}, // not a valid octal triple, kept as-is
+		{`/short\04`, `/short\04`},         // too short to be a full escape
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {

@@ -24,14 +24,14 @@ import (
 	"strings"
 	"syscall"
 
-	kConfig "github.com/xxmime/kaniko/pkg/config"
-	"github.com/xxmime/kaniko/pkg/constants"
-	"github.com/xxmime/kaniko/pkg/dockerfile"
-	"github.com/xxmime/kaniko/pkg/util"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	kConfig "github.com/xxmime/kaniko/pkg/config"
+	"github.com/xxmime/kaniko/pkg/constants"
+	"github.com/xxmime/kaniko/pkg/dockerfile"
+	"github.com/xxmime/kaniko/pkg/util"
 )
 
 type RunCommand struct {
@@ -122,6 +122,19 @@ func runCommandInExec(config *v1.Config, buildArgs *dockerfile.BuildArgs, cmdRun
 	}
 
 	cmd.Env = env
+
+	if filepath.Clean(kConfig.RootDir) != "/" {
+		lookPathFn := func(name string) (string, error) {
+			return lookPath(name, pathEnvFrom(replacementEnvs))
+		}
+		validateFn := func(absPath string) error {
+			return validateExecutableInRoot(absPath)
+		}
+		procExe := util.ResolveSandboxProcSelfExeTarget(newCommand, cmdRun.PrependShell, lookPathFn, validateFn)
+		if err := util.UpdateSandboxProcSelfStub(kConfig.RootDir, procExe, newCommand); err != nil {
+			logrus.Warnf("Sandbox: could not update /proc/self stub: %v", err)
+		}
+	}
 
 	logrus.Infof("Running: %s", cmd.Args)
 	if err := cmd.Start(); err != nil {
@@ -308,4 +321,13 @@ func validateExecutableInRoot(file string) error {
 		return os.ErrPermission
 	}
 	return nil
+}
+
+func pathEnvFrom(envs []string) string {
+	for _, env := range envs {
+		if after, ok := strings.CutPrefix(env, "PATH="); ok {
+			return after
+		}
+	}
+	return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 }

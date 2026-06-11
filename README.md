@@ -46,6 +46,7 @@ _If you are interested in contributing to kaniko, see
 **Table of Contents** _generated with
 [DocToc](https://github.com/thlorenz/doctoc)_
 
+- [🧊 This project is archived and no longer developed or maintained. 🧊](#-this-project-is-archived-and-no-longer-developed-or-maintained-)
 - [kaniko - Build Images In Kubernetes](#kaniko---build-images-in-kubernetes)
   - [🚨NOTE: kaniko is not an officially supported Google product🚨](#note-kaniko-is-not-an-officially-supported-google-product)
   - [Community](#community)
@@ -54,6 +55,7 @@ _If you are interested in contributing to kaniko, see
   - [Demo](#demo)
   - [Tutorial](#tutorial)
   - [Using kaniko](#using-kaniko)
+    - [Downloading Pre-built Binaries](#downloading-pre-built-binaries)
     - [kaniko Build Contexts](#kaniko-build-contexts)
     - [Using Azure Blob Storage](#using-azure-blob-storage)
     - [Using Private Git Repository](#using-private-git-repository)
@@ -101,6 +103,7 @@ _If you are interested in contributing to kaniko, see
       - [Flag `--no-push`](#flag---no-push)
       - [Flag `--no-push-cache`](#flag---no-push-cache)
       - [Flag `--oci-layout-path`](#flag---oci-layout-path)
+      - [Flag `--push-ignore-immutable-tag-errors`](#flag---push-ignore-immutable-tag-errors)
       - [Flag `--push-retry`](#flag---push-retry)
       - [Flag `--registry-certificate`](#flag---registry-certificate)
       - [Flag `--registry-client-cert`](#flag---registry-client-cert)
@@ -139,6 +142,7 @@ _If you are interested in contributing to kaniko, see
   - [Community](#community-1)
   - [Limitations](#limitations)
     - [mtime and snapshotting](#mtime-and-snapshotting)
+    - [Dockerfile commands `--chown` support](#dockerfile-commands---chown-support)
   - [References](#references)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
@@ -1135,12 +1139,34 @@ which is enough to bind-mount `/proc`, `/sys` and `/dev`. The kernel
 destroys the namespace (and all its mounts) when the child exits, so
 nothing is leaked back to the host.
 
-The auto-re-exec uses the standard rootless-container pattern (`CLONE_NEWUSER
-| CLONE_NEWNS` with a `0 <uid> 1` mapping) and works in any environment that:
+The auto-re-exec tries several strategies (`CLONE_NEWUSER | CLONE_NEWNS`,
+`CLONE_NEWUSER` followed by `unshare(CLONE_NEWNS)` in the child, full and
+single uid/gid maps) via `/proc/self/exe`. It works in any environment that:
 
 - has `kernel.unprivileged_userns_clone = 1` (default on most modern
   distros, including GitHub Actions Ubuntu runners), and
 - does not block the `unshare(CLONE_NEWUSER)` syscall via seccomp / LSM.
+
+If every strategy fails, kaniko logs a warning and continues without the
+user-namespace fallback. It then creates **stub** `/proc`, `/sys` and `/dev`
+trees inside the sandbox (regular directories and files, no `mount(2)`),
+including minimal `/proc/cpuinfo` and `/dev/{null,zero,urandom,stdin,...}`.
+Before each `RUN` command the stub `/proc/self/exe` and `/proc/self/cmdline`
+entries are updated for the toolchain that needs them. Kaniko understands
+common build front-ends and points at the underlying compiler/runtime:
+
+| RUN example | stub `/proc/self/exe` target |
+|-------------|------------------------------|
+| `zig build` | `zig` |
+| `cargo build` | `rustc` (not `cargo`) |
+| `go build` | `go` |
+| `npm run build` | `node` |
+| `python3 -m pip install` | `python3` |
+| `cmake && make && cargo build` | `rustc` (highest-priority compiler in script) |
+
+This lets Zig, Rust, Go, Node, Python and similar stacks resolve their install
+paths through `/proc/self/exe` **without** `CAP_SYS_ADMIN`, including hardened
+runners that block user namespaces entirely.
 
 You can opt out of the fallback by setting `KANIKO_SANDBOX_USERNS=skip`,
 which is useful if you are sure you have `CAP_SYS_ADMIN` but
