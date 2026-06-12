@@ -45,24 +45,55 @@ func TestResolveSandboxProcSelfExeTarget(t *testing.T) {
 		"python3": "/usr/bin/python3",
 		"cmake":  "/usr/bin/cmake",
 	}
-	lookPath := func(name string) (string, error) {
-		if p, ok := paths[name]; ok {
-			return p, nil
-		}
-		return "", errTestNotFound
+	// Binaries that exist on PATH but are not recognized toolchains. These
+	// model the tools already present before a RUN installs its compiler.
+	genericPaths := map[string]string{
+		"curl":  "/usr/bin/curl",
+		"sh":    "/bin/sh",
+		"mv":    "/bin/mv",
+		"cp":    "/bin/cp",
+		"upx":   "/usr/bin/upx",
+		"mkdir": "/bin/mkdir",
 	}
-	validateAbs := func(path string) error {
-		if _, ok := paths[path]; ok || path == "./install.sh" {
-			return nil
+	// resolverFor builds lookPath/validateAbs closures. withToolchain controls
+	// whether the recognized compilers (rustc/cargo/…) resolve yet; when false
+	// only the generic binaries are available, modeling a RUN that installs its
+	// toolchain partway through.
+	resolverFor := func(withToolchain bool) (LookPathFunc, ValidateExecutableFunc) {
+		available := map[string]string{}
+		for k, v := range genericPaths {
+			available[k] = v
 		}
-		return errTestNotFound
+		if withToolchain {
+			for k, v := range paths {
+				available[k] = v
+			}
+		}
+		byPath := map[string]bool{}
+		for _, v := range available {
+			byPath[v] = true
+		}
+		lookPath := func(name string) (string, error) {
+			if p, ok := available[name]; ok {
+				return p, nil
+			}
+			return "", errTestNotFound
+		}
+		validateAbs := func(path string) error {
+			if byPath[path] || path == "./install.sh" {
+				return nil
+			}
+			return errTestNotFound
+		}
+		return lookPath, validateAbs
 	}
 
 	cases := []struct {
-		name   string
-		cmd    []string
-		shell  bool
-		want   string
+		name        string
+		cmd         []string
+		shell       bool
+		noToolchain bool
+		want        string
 	}{
 		{
 			name:  "zig direct",
@@ -100,9 +131,30 @@ func TestResolveSandboxProcSelfExeTarget(t *testing.T) {
 			shell: false,
 			want:  "/usr/local/go/bin/go",
 		},
+		{
+			// The toolchain is installed inside the same RUN, so neither rustup
+			// nor cargo nor rustc resolves yet. The stub must fall back to the
+			// shell, never to an unrelated binary like curl, otherwise the
+			// rustup/cargo proxy re-execs curl via current_exe().
+			name:        "toolchain installed mid-run falls back to shell",
+			cmd:         []string{"/bin/sh", "-c", "curl https://sh.rustup.rs -sSf | sh -s -- -y && rustup target add x86_64-unknown-linux-musl && cargo build --release && mv a b && upx x && mkdir -p c && cp a b"},
+			shell:       true,
+			noToolchain: true,
+			want:        "/bin/sh",
+		},
+		{
+			// A single unrecognized command is unambiguous, so it is safe to
+			// point /proc/self/exe at it.
+			name:        "single generic command is trusted",
+			cmd:         []string{"/bin/sh", "-c", "curl https://example.com -o out"},
+			shell:       true,
+			noToolchain: true,
+			want:        "/usr/bin/curl",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			lookPath, validateAbs := resolverFor(!c.noToolchain)
 			got := ResolveSandboxProcSelfExeTarget(c.cmd, c.shell, lookPath, validateAbs)
 			testutil.CheckDeepEqual(t, c.want, got)
 		})

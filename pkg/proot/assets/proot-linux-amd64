@@ -1,0 +1,9 @@
+kaniko embedded-proot placeholder (linux/amd64).
+
+This text file is a placeholder so that `go build` works from a clean checkout.
+It is NOT a real proot binary: pkg/proot.Binary() detects the missing ELF magic
+and reports "no embedded proot".
+
+The release build replaces this file with a statically linked proot binary via
+`hack/fetch-proot.sh amd64` (see the Makefile `embed-proot` target) before
+compiling, so the published kaniko binary ships a working proot.
