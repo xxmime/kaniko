@@ -47,8 +47,23 @@ export GO111MODULE = on
 export GOFLAGS = -mod=vendor
 
 
-out/executor: $(GO_FILES)
+# Per-arch static proot embedded into the executor (pkg/proot). Committed as a
+# placeholder; run `make embed-proot` to replace it with a real binary before a
+# release build.
+PROOT_ASSET = pkg/proot/assets/proot-linux-$(GOARCH)
+
+.PHONY: embed-proot
+embed-proot:
+	@ ./hack/fetch-proot.sh $(GOARCH)
+
+out/executor: $(GO_FILES) $(PROOT_ASSET)
 	GOARCH=$(GOARCH) GOOS=$(GOOS) CGO_ENABLED=0 go build -ldflags $(GO_LDFLAGS) -o $@ $(EXECUTOR_PACKAGE)
+
+# Build stand-alone executor binaries (with embedded proot) for one or more
+# architectures, e.g. `make build-binaries` or `PLATFORMS="amd64" make build-binaries`.
+.PHONY: build-binaries
+build-binaries:
+	@ ./scripts/build-binaries.sh
 
 out/warmer: $(GO_FILES)
 	GOARCH=$(GOARCH) GOOS=$(GOOS) CGO_ENABLED=0 go build -ldflags $(GO_LDFLAGS) -o $@ $(WARMER_PACKAGE)
