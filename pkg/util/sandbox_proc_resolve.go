@@ -21,6 +21,12 @@ import (
 	"strings"
 )
 
+// procSelfExeGenericScore is the score given to an executable that resolves on
+// PATH but is not a recognized compiler/runtime (see procSelfExePriority). Any
+// score above this means the binary is a known toolchain that legitimately
+// reads /proc/self/exe.
+const procSelfExeGenericScore = 10
+
 // LookPathFunc resolves an executable name against PATH inside the sandbox.
 type LookPathFunc func(name string) (string, error)
 
@@ -84,17 +90,40 @@ func ResolveSandboxProcSelfExeTarget(cmd []string, prependShell bool, lookPath L
 		return resolveProcSelfExeCandidate(cmd[0], lookPath, validateAbs)
 	}
 
-	bestPath := ""
-	bestScore := -1
+	recognizedPath := ""
+	recognizedScore := -1
+	genericPaths := map[string]struct{}{}
 	for _, word := range shellExecutables(cmd[2]) {
 		path, score := bestProcSelfExeForWord(word, lookPath, validateAbs)
-		if score > bestScore && path != "" {
-			bestPath = path
-			bestScore = score
+		if path == "" {
+			continue
 		}
+		if score > procSelfExeGenericScore {
+			if score > recognizedScore {
+				recognizedPath = path
+				recognizedScore = score
+			}
+			continue
+		}
+		genericPaths[path] = struct{}{}
 	}
-	if bestPath != "" {
-		return bestPath
+	if recognizedPath != "" {
+		return recognizedPath
+	}
+	// No recognized compiler/runtime resolved. This is common when the
+	// toolchain is installed later in the same RUN (e.g. `curl … | sh` fetches
+	// rustup, then `rustup target add … && cargo build`). In that case we must
+	// NOT point the stub /proc/self/exe at an arbitrary unrelated binary such
+	// as curl: tools that re-exec themselves via current_exe() (the rustup and
+	// cargo proxies, the glibc loader, …) would then run that binary with their
+	// own arguments — which is exactly how `rustup target add …` ends up
+	// executing `curl target add …`. Only trust a generic binary when it is the
+	// single resolvable command; otherwise fall back to the shell, a neutral
+	// target that never hijacks current_exe()-based re-exec.
+	if len(genericPaths) == 1 {
+		for p := range genericPaths {
+			return p
+		}
 	}
 	return resolveProcSelfExeCandidate(cmd[0], lookPath, validateAbs)
 }
@@ -155,7 +184,7 @@ func resolveProcSelfExeCandidateWithScore(word string, lookPath LookPathFunc, va
 	base := strings.ToLower(filepath.Base(path))
 	score := procSelfExePriority[base]
 	if score == 0 {
-		score = 10 // unknown but resolved executable
+		score = procSelfExeGenericScore // unknown but resolved executable
 	}
 	return path, score
 }

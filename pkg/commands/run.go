@@ -325,6 +325,12 @@ func sandboxProotPath() string {
 	if p, err := exec.LookPath("proot"); err == nil {
 		return p
 	}
+	// Nothing is bundled (typical when kaniko runs as a stand-alone binary
+	// rather than from its container image). Try to fetch a static proot so
+	// sandboxed builds of toolchains that rely on /proc/self/exe still work.
+	if p := provisionProot(); p != "" {
+		return p
+	}
 	return ""
 }
 
