@@ -161,6 +161,71 @@ func Test_RootedPathResolvesAbsoluteSymlinkInsideRoot(t *testing.T) {
 	testutil.CheckErrorAndDeepEqual(t, false, err, filepath.Join(root, "target", "file"), got)
 }
 
+// Test_ExtractFileReplacesLeafSymlinkInsteadOfFollowingIt reproduces the
+// sandbox-mode corruption where extracting a regular file over an existing
+// leaf symlink followed the symlink and overwrote its target. In an Alpine
+// rootfs /usr/bin/strings is a busybox applet symlink to /bin/busybox; when
+// the binutils package installs a real /usr/bin/strings the old code wrote the
+// strings binary into /bin/busybox, so /bin/sh -> /bin/busybox then executed
+// strings.
+func Test_ExtractFileReplacesLeafSymlinkInsteadOfFollowingIt(t *testing.T) {
+	originalRootDir := config.RootDir
+	originalIgnoreList := ignorelist
+	defer func() {
+		config.RootDir = originalRootDir
+		ignorelist = originalIgnoreList
+	}()
+
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.RootDir = root
+	ignorelist = append([]IgnoreListEntry{}, defaultIgnoreList...)
+
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bin", "busybox"), []byte("BUSYBOX"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "usr", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// busybox applet symlink that the real strings binary should replace.
+	if err := os.Symlink("/bin/busybox", filepath.Join(root, "usr", "bin", "strings")); err != nil {
+		t.Fatal(err)
+	}
+
+	hdr := &tar.Header{
+		Name:     "usr/bin/strings",
+		Size:     int64(len("STRINGS")),
+		Typeflag: tar.TypeReg,
+		Mode:     0o755,
+		Uid:      os.Getuid(),
+		Gid:      os.Getgid(),
+	}
+	if err := ExtractFile(root, hdr, filepath.Clean(hdr.Name), strings.NewReader("STRINGS")); err != nil {
+		t.Fatal(err)
+	}
+
+	stringsContent, err := os.ReadFile(filepath.Join(root, "usr", "bin", "strings"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stringsContent) != "STRINGS" {
+		t.Fatalf("usr/bin/strings = %q, want %q", stringsContent, "STRINGS")
+	}
+
+	busyboxContent, err := os.ReadFile(filepath.Join(root, "bin", "busybox"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(busyboxContent) != "BUSYBOX" {
+		t.Fatalf("bin/busybox was overwritten by following the strings symlink: got %q, want %q", busyboxContent, "BUSYBOX")
+	}
+}
+
 func Test_DeleteFilesystemWithSandboxRootDoesNotDeleteOutsideRoot(t *testing.T) {
 	originalRootDir := config.RootDir
 	originalMountInfoPath := config.MountInfoPath

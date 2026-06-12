@@ -170,6 +170,27 @@ func ResolvePathInRoot(path string) (string, error) {
 	return securejoin.SecureJoin(cleanedRoot, unsafePath)
 }
 
+// resolveLeafInRoot resolves the parent directory of p within config.RootDir
+// (following directory symlinks but clamping inside the root to prevent
+// escapes) while keeping the final path component literal.
+//
+// This matters when a layer replaces an existing symlink with a regular file
+// or a different symlink: resolving the full path with ResolvePathInRoot would
+// follow the existing leaf symlink and operate on its target instead of the
+// entry itself. For example busybox ships /usr/bin/strings as a symlink to
+// /bin/busybox; when the binutils package later installs a real
+// /usr/bin/strings, following the old symlink would overwrite /bin/busybox
+// with the strings binary (breaking /bin/sh -> /bin/busybox). Keeping the leaf
+// literal makes the replacement overwrite the symlink itself, matching how the
+// extraction behaves when RootDir is "/".
+func resolveLeafInRoot(p string) (string, error) {
+	resolvedDir, err := ResolvePathInRoot(filepath.Dir(p))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(resolvedDir, filepath.Base(p)), nil
+}
+
 func IncludeWhiteout() FSOpt {
 	return func(opts *FSConfig) {
 		opts.includeWhiteout = true
@@ -358,7 +379,7 @@ func UnTar(r io.Reader, dest string) ([]string, error) {
 func ExtractFile(dest string, hdr *tar.Header, cleanedName string, tr io.Reader) error {
 	path := filepath.Join(dest, cleanedName)
 	if shouldResolveInRoot(dest) {
-		rootedPath, err := ResolvePathInRoot(path)
+		rootedPath, err := resolveLeafInRoot(path)
 		if err != nil {
 			return err
 		}
@@ -457,7 +478,7 @@ func ExtractFile(dest string, hdr *tar.Header, cleanedName string, tr io.Reader)
 		}
 		link := filepath.Clean(filepath.Join(dest, linkName))
 		if shouldResolveInRoot(dest) {
-			link, err = ResolvePathInRoot(link)
+			link, err = resolveLeafInRoot(link)
 			if err != nil {
 				return err
 			}
