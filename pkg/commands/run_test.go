@@ -29,6 +29,7 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/xxmime/kaniko/pkg/config"
 	"github.com/xxmime/kaniko/pkg/dockerfile"
+	"github.com/xxmime/kaniko/pkg/util"
 	"github.com/xxmime/kaniko/testutil"
 )
 
@@ -356,4 +357,91 @@ func TestLookPathWithSandboxRoot(t *testing.T) {
 
 	got, err := lookPath("tool", "/bin")
 	testutil.CheckErrorAndDeepEqual(t, false, err, "/bin/tool", got)
+}
+
+func TestProotUserSpec(t *testing.T) {
+	for _, userStr := range []string{"", "root", "0", "0:0"} {
+		if got := prootUserSpec(userStr); got != "" {
+			t.Errorf("prootUserSpec(%q) = %q, want \"\" (run as fake root)", userStr, got)
+		}
+	}
+}
+
+func TestBuildSandboxProotCommand(t *testing.T) {
+	cmd := buildSandboxProotCommand("/kaniko/proot", "/kaniko/sandbox", "/work", "", []string{"/bin/sh", "-c", "echo hi"})
+
+	want := []string{
+		"/kaniko/proot",
+		"-r", "/kaniko/sandbox",
+		"-b", "/proc",
+		"-b", "/dev",
+		"-b", "/sys",
+		"-w", "/work",
+		"-0",
+		"/bin/sh", "-c", "echo hi",
+	}
+	testutil.CheckDeepEqual(t, want, cmd.Args)
+
+	// proot performs its own chroot and id mapping, so the child process must
+	// not also chroot or set credentials.
+	if cmd.SysProcAttr == nil {
+		t.Fatal("expected SysProcAttr to be set")
+	}
+	if cmd.SysProcAttr.Chroot != "" {
+		t.Errorf("Chroot = %q, want empty (proot handles the chroot)", cmd.SysProcAttr.Chroot)
+	}
+	if cmd.SysProcAttr.Credential != nil {
+		t.Error("Credential should be nil (proot handles uid/gid)")
+	}
+}
+
+func TestBuildSandboxProotCommandOmitsWorkdirWhenEmpty(t *testing.T) {
+	cmd := buildSandboxProotCommand("/kaniko/proot", "/kaniko/sandbox", "", "", []string{"/bin/sh"})
+	for _, a := range cmd.Args {
+		if a == "-w" {
+			t.Fatalf("did not expect -w in args when workdir is empty: %v", cmd.Args)
+		}
+	}
+}
+
+func TestSandboxProotPath(t *testing.T) {
+	originalRootDir := config.RootDir
+	originalBindMounted := util.SandboxKernelFSBindMounted
+	originalEnv, hadEnv := os.LookupEnv("KANIKO_PROOT")
+	defer func() {
+		config.RootDir = originalRootDir
+		util.SandboxKernelFSBindMounted = originalBindMounted
+		if hadEnv {
+			os.Setenv("KANIKO_PROOT", originalEnv)
+		} else {
+			os.Unsetenv("KANIKO_PROOT")
+		}
+	}()
+
+	// A real, executable proot to point KANIKO_PROOT at.
+	prootBin := filepath.Join(t.TempDir(), "proot")
+	if err := os.WriteFile(prootBin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.Setenv("KANIKO_PROOT", prootBin)
+
+	// Not in sandbox mode: never use proot.
+	config.RootDir = "/"
+	util.SandboxKernelFSBindMounted = false
+	if got := sandboxProotPath(); got != "" {
+		t.Errorf("sandboxProotPath() with RootDir=/ = %q, want \"\"", got)
+	}
+
+	// Sandbox mode but a real /proc was bind-mounted: native chroot is fine.
+	config.RootDir = "/kaniko/sandbox"
+	util.SandboxKernelFSBindMounted = true
+	if got := sandboxProotPath(); got != "" {
+		t.Errorf("sandboxProotPath() with bind-mounted /proc = %q, want \"\"", got)
+	}
+
+	// Sandbox mode with stub /proc: use proot.
+	util.SandboxKernelFSBindMounted = false
+	if got := sandboxProotPath(); got != prootBin {
+		t.Errorf("sandboxProotPath() with stub /proc = %q, want %q", got, prootBin)
+	}
 }

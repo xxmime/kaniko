@@ -87,19 +87,8 @@ func runCommandInExec(config *v1.Config, buildArgs *dockerfile.BuildArgs, cmdRun
 	logrus.Infof("Cmd: %s", newCommand[0])
 	logrus.Infof("Args: %s", newCommand[1:])
 
-	cmd := exec.Command(newCommand[0], newCommand[1:]...)
-
-	cmd.Dir = setWorkDirIfExists(config.WorkingDir)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 	replacementEnvs := buildArgs.ReplacementEnvs(config.Env)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if filepath.Clean(kConfig.RootDir) != "/" {
-		cmd.SysProcAttr.Chroot = kConfig.RootDir
-		if cmd.Dir == "" {
-			cmd.Dir = "/"
-		}
-	}
+	workDir := setWorkDirIfExists(config.WorkingDir)
 
 	u := config.User
 	userAndGroup := strings.Split(u, ":")
@@ -108,36 +97,61 @@ func runCommandInExec(config *v1.Config, buildArgs *dockerfile.BuildArgs, cmdRun
 		return errors.Wrapf(err, "resolving user %s", userAndGroup[0])
 	}
 
-	// If specified, run the command as a specific user
-	if userStr != "" {
-		cmd.SysProcAttr.Credential, err = util.SyscallCredentials(userStr)
-		if err != nil {
-			return errors.Wrap(err, "credentials")
-		}
-	}
-
 	env, err := addDefaultHOME(userStr, replacementEnvs)
 	if err != nil {
 		return errors.Wrap(err, "adding default HOME variable")
 	}
 
-	cmd.Env = env
-
-	if filepath.Clean(kConfig.RootDir) != "/" {
-		lookPathFn := func(name string) (string, error) {
-			return lookPath(name, pathEnvFrom(replacementEnvs))
+	var cmd *exec.Cmd
+	usingProot := false
+	if prootPath := sandboxProotPath(); prootPath != "" {
+		usingProot = true
+		// No real /proc could be bind-mounted (no CAP_SYS_ADMIN and no usable
+		// user namespace). Run the command through proot, which emulates the
+		// chroot and, crucially, a correct per-process /proc/self/exe in user
+		// space so tools that call current_exe() (rustc, cargo, zig, the glibc
+		// loader, ...) work. proot fakes uid/gid itself, so here we neither
+		// chroot nor set credentials nor maintain the /proc/self/exe stub.
+		cmd = buildSandboxProotCommand(prootPath, kConfig.RootDir, workDir, userStr, newCommand)
+		logrus.Infof("Sandbox: running RUN through proot (%s) because /proc could not be bind-mounted", prootPath)
+	} else {
+		cmd = exec.Command(newCommand[0], newCommand[1:]...)
+		cmd.Dir = workDir
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if filepath.Clean(kConfig.RootDir) != "/" {
+			cmd.SysProcAttr.Chroot = kConfig.RootDir
+			if cmd.Dir == "" {
+				cmd.Dir = "/"
+			}
+			lookPathFn := func(name string) (string, error) {
+				return lookPath(name, pathEnvFrom(replacementEnvs))
+			}
+			validateFn := func(absPath string) error {
+				return validateExecutableInRoot(absPath)
+			}
+			procExe := util.ResolveSandboxProcSelfExeTarget(newCommand, cmdRun.PrependShell, lookPathFn, validateFn)
+			if err := util.UpdateSandboxProcSelfStub(kConfig.RootDir, procExe, newCommand); err != nil {
+				logrus.Warnf("Sandbox: could not update /proc/self stub: %v", err)
+			}
 		}
-		validateFn := func(absPath string) error {
-			return validateExecutableInRoot(absPath)
-		}
-		procExe := util.ResolveSandboxProcSelfExeTarget(newCommand, cmdRun.PrependShell, lookPathFn, validateFn)
-		if err := util.UpdateSandboxProcSelfStub(kConfig.RootDir, procExe, newCommand); err != nil {
-			logrus.Warnf("Sandbox: could not update /proc/self stub: %v", err)
+		// If specified, run the command as a specific user.
+		if userStr != "" {
+			cmd.SysProcAttr.Credential, err = util.SyscallCredentials(userStr)
+			if err != nil {
+				return errors.Wrap(err, "credentials")
+			}
 		}
 	}
 
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = env
+
 	logrus.Infof("Running: %s", cmd.Args)
 	if err := cmd.Start(); err != nil {
+		if usingProot {
+			return errors.Wrap(err, "starting command through proot (proot relies on the ptrace syscall; ensure the runner's seccomp profile permits ptrace)")
+		}
 		return errors.Wrap(err, "starting command")
 	}
 
@@ -277,6 +291,86 @@ func (cr *CachingRunCommand) String() string {
 
 func (cr *CachingRunCommand) MetadataOnly() bool {
 	return false
+}
+
+// sandboxProotPath returns the path to a proot binary when RUN commands should
+// be executed through proot, or "" otherwise.
+//
+// proot is used only when building in sandbox mode (RootDir != "/") and a real
+// /proc could NOT be bind-mounted (no CAP_SYS_ADMIN and no usable user
+// namespace). In that situation the stub /proc/self/exe cannot satisfy tools
+// that read it per-process (rustc, cargo, zig, the glibc loader, ...), but
+// proot emulates both the chroot and a correct /proc/self/exe in user space.
+// When a real /proc is available (host has CAP_SYS_ADMIN, or we re-exec'd into
+// a user namespace) the native chroot is faster and equally correct, so proot
+// is skipped.
+func sandboxProotPath() string {
+	if filepath.Clean(kConfig.RootDir) == "/" {
+		return ""
+	}
+	if util.SandboxKernelFSBindMounted {
+		return ""
+	}
+	if p := os.Getenv("KANIKO_PROOT"); p != "" {
+		if isExecutableFile(p) {
+			return p
+		}
+		logrus.Warnf("Sandbox: KANIKO_PROOT=%s is not an executable file; ignoring", p)
+	}
+	for _, cand := range []string{"/kaniko/proot", "/usr/local/bin/proot", "/busybox/proot"} {
+		if isExecutableFile(cand) {
+			return cand
+		}
+	}
+	if p, err := exec.LookPath("proot"); err == nil {
+		return p
+	}
+	return ""
+}
+
+func isExecutableFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	return info.Mode()&0o111 != 0
+}
+
+// buildSandboxProotCommand wraps command in a proot invocation that roots into
+// root, binds the host's kernel filesystems (so /proc/self/exe resolves
+// correctly) and fakes the requested uid/gid. proot performs the chroot and id
+// mapping itself, so the returned *exec.Cmd must not set Chroot or Credential.
+func buildSandboxProotCommand(prootPath, root, workDir, userStr string, command []string) *exec.Cmd {
+	args := []string{"-r", root, "-b", "/proc", "-b", "/dev", "-b", "/sys"}
+	if workDir != "" {
+		args = append(args, "-w", workDir)
+	}
+	if spec := prootUserSpec(userStr); spec != "" {
+		args = append(args, "-i", spec)
+	} else {
+		args = append(args, "-0")
+	}
+	args = append(args, command...)
+	cmd := exec.Command(prootPath, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return cmd
+}
+
+// prootUserSpec returns the "uid:gid" string proot should impersonate, or ""
+// to run as fake root (proot -0). Most RUN steps need root (apk, adduser,
+// chown); a non-root USER is resolved via the same credential lookup the
+// native path uses.
+func prootUserSpec(userStr string) string {
+	switch userStr {
+	case "", "root", "0", "0:0":
+		return ""
+	}
+	cred, err := util.SyscallCredentials(userStr)
+	if err != nil {
+		logrus.Warnf("Sandbox: could not resolve user %q for proot, running as root: %v", userStr, err)
+		return ""
+	}
+	return fmt.Sprintf("%d:%d", cred.Uid, cred.Gid)
 }
 
 // todo: this should create the workdir if it doesn't exist, atleast this is what docker does
